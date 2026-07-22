@@ -90,12 +90,12 @@ encrypted_password = "" # password used for p12 certificate, encrypted by decryp
 user = ""               # user associated with terminations, sent in API call to terminate
 
 [argocd]
-enabled = false               # if true, enable the Argo CD sync/health gate + annotation write-back
+enabled = false               # master switch for the Argo CD sync/health gate (write-back also needs trackers=["argocd"])
 endpoint = ""                 # Argo CD API server base URL, e.g. https://argocd.example.com
 token = ""                    # inline bearer token (JWT); prefer token_file in production
-token_file = ""               # path to a file containing the bearer token
+token_file = ""               # path to a file containing the bearer token (takes precedence over token)
 project = ""                  # optional Argo CD project used to scope Application lookups
-applications = []             # chaos-eligible Argo CD Application names/selectors
+applications = []             # exact chaos-eligible Argo CD Application names (matched against Application metadata.name)
 insecure_skip_verify = false  # skip TLS verification to the Argo CD server
 ca_cert = ""                  # path to a PEM CA bundle to verify the Argo CD server cert
 timeout = 30                  # per-request timeout in seconds
@@ -111,9 +111,15 @@ Note that many of these configuration parameters (decryptor, trackers,
 error_counter, outage_checker) currently only have no-op implementations.
 
 To enable the optional Argo CD integration, set `argocd.enabled = true` and
-configure the `[argocd]` section above. The Argo CD sync/health gate then skips
-terminating any instance whose governing Argo CD `Application` is not both
-`Synced` and `Healthy`. To also record chaos actions back to Argo CD, activate
-the write-back by adding `"argocd"` to the `trackers` list (for example,
-`trackers = ["argocd"]`). See the [Argo CD plugin documentation](plugins/ArgoCD)
-for full details.
+configure the `[argocd]` section above. `argocd.enabled` is the master switch
+for the sync/health gate only; it does not by itself enable write-back. List the
+exact names of the chaos-eligible Argo CD `Application` resources in
+`argocd.applications` (an empty list makes no Application eligible, so the gate
+denies every experiment). When a termination target correlates to one of those
+Applications through a live managed workload in its `status.resources`, the gate
+permits the experiment only while that `Application` is both `Synced` and
+`Healthy`; on any error, missing Application, ambiguity, or uncertain ownership
+it **fails closed** and skips the experiment. To additionally record chaos
+actions back to Argo CD, activate the best-effort write-back by adding
+`"argocd"` to the `trackers` list (for example, `trackers = ["argocd"]`). See
+the [Argo CD plugin documentation](plugins/ArgoCD) for full details.

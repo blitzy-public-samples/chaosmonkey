@@ -33,13 +33,21 @@ AWS, [GCE][gce-blogpost], and Kubernetes.
 ### Argo CD integration (optional)
 
 Chaos Monkey can optionally coordinate with [Argo CD] so it does not disrupt
-workloads that GitOps currently considers unstable. When enabled, Chaos Monkey
-skips terminating any instance whose governing Argo CD `Application` is not
-both `Synced` and `Healthy`, and it writes a best-effort annotation back to the
-`Application` so the chaos action appears in the Argo CD timeline. The feature
-is **opt-in and disabled by default**; when it is not configured, Chaos Monkey
-behaves exactly as before. See the [Argo CD plugin documentation][argocd-docs]
-for configuration details.
+workloads that GitOps currently considers unstable. An operator marks specific
+Argo CD `Application` resources as chaos-eligible; when a termination target
+correlates to one of those Applications through its managed resources, Chaos
+Monkey permits the experiment only while that `Application` is both `Synced` and
+`Healthy` with a live managed workload. Otherwise it **fails closed** — on any
+error, missing Application, ambiguity, or uncertain ownership it skips the
+experiment rather than risk an unsafe termination. It can additionally write a
+best-effort annotation back to the `Application` recording the chaos action;
+that annotation is stored on the `Application` and is visible through the Argo
+CD API and the Application's resource/manifest (annotations) view. Surfacing it
+as a notification additionally requires a custom Argo CD Notifications trigger
+and template. The gate is **additive** to Chaos Monkey's existing safety
+controls. The feature is **opt-in and disabled by default**; when it is not
+configured, Chaos Monkey behaves exactly as before. See the [Argo CD plugin
+documentation][argocd-docs] for configuration details.
 
 ### Install locally
 

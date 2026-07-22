@@ -14,257 +14,400 @@
 
 package argocd
 
-// White-box unit tests for mapper.go. They exercise the instance-to-Application
-// resolution rules (allow-list vs. fallback), the InstanceGroup-aware variant,
-// and the ManagedWorkloads filtering of status.resources[]. The (name, ok)
-// contract is the resolution-layer half of the integration's fail-closed
-// guarantee: an unresolvable target must yield ok=false so precheck.go can turn
-// it into a safe skip.
+// White-box, table-driven safety tests for mapper.go and the resource-level
+// predicates in application.go. They assert the fail-closed ownership contract
+// that Capability A depends on:
 //
-// These tests deliberately use the standard-library testing package only. The
-// Argo CD integration is constrained to leave go.mod/go.sum untouched, and
-// importing a third-party assertion library (e.g. testify) would require adding
-// its transitive dependencies to go.mod. The plain-testing style also matches
-// the rest of the repository's test suite (e.g. spinnaker/terminator_test.go).
+//   - an empty eligibility allow-list authorizes NOTHING;
+//   - eligibility is exact-name only (with normalization);
+//   - a target is bound to an Application only when that Application is eligible
+//     AND its status.resources[] contains exactly one live workload resource
+//     whose name matches the target — never by bare Application-name coincidence;
+//   - nil/typed-nil/ambiguous/ineligible/non-live inputs all deny without panic.
+//
+// The tests use only the standard-library testing package with a table-driven
+// style, matching the rest of the repository's test suite (testify is not used
+// anywhere in the module).
 
 import (
 	"testing"
 
+	"github.com/Netflix/chaosmonkey/v2"
 	"github.com/Netflix/chaosmonkey/v2/grp"
 	"github.com/Netflix/chaosmonkey/v2/mock"
 )
 
-// -----------------------------------------------------------------------------
-// Resolution — no allow-list (fallback path)
-//
-// With no configured Application allow-list, the first non-empty candidate is
-// used directly as the Application name. Candidate order is cluster then app.
-// -----------------------------------------------------------------------------
+// nilableInstance embeds the Instance interface so that a (*nilableInstance)(nil)
+// value satisfies chaosmonkey.Instance yet is a typed-nil whose promoted methods
+// would panic if invoked. It proves ManagedResourceFor guards typed-nil inputs.
+type nilableInstance struct{ chaosmonkey.Instance }
 
-// TestApplicationForInstance_NoAllowList_ClusterWins verifies that, absent an
-// allow-list, the instance's cluster name is preferred as the Application name.
-func TestApplicationForInstance_NoAllowList_ClusterWins(t *testing.T) {
-	m := NewMapper(nil)
-	ins := mock.Instance{App: "foo", Cluster: "foo-beta"}
-
-	name, ok := m.ApplicationForInstance(ins)
-
-	if !ok {
-		t.Fatalf("expected the target to resolve, got ok=false")
-	}
-	if got, want := name, "foo-beta"; got != want {
-		t.Errorf("got name=%q, want %q (cluster is the first candidate)", got, want)
-	}
+// healthy builds a live workload ResourceStatus (health reported and Healthy).
+func healthy(group, kind, name string) ResourceStatus {
+	return ResourceStatus{Group: group, Kind: kind, Name: name, Health: &HealthStatus{Status: HealthStatusHealthy}}
 }
 
-// TestApplicationForInstance_NoAllowList_AppFallback verifies that the app name
-// is used when the cluster name is empty.
-func TestApplicationForInstance_NoAllowList_AppFallback(t *testing.T) {
-	m := NewMapper(nil)
-	ins := mock.Instance{App: "foo", Cluster: ""}
-
-	name, ok := m.ApplicationForInstance(ins)
-
-	if !ok {
-		t.Fatalf("expected the target to resolve via the app fallback, got ok=false")
-	}
-	if got, want := name, "foo"; got != want {
-		t.Errorf("got name=%q, want %q (app is used when cluster is empty)", got, want)
-	}
+// withHealth builds a workload ResourceStatus with an explicit health string.
+func withHealth(group, kind, name, health string) ResourceStatus {
+	return ResourceStatus{Group: group, Kind: kind, Name: name, Health: &HealthStatus{Status: health}}
 }
 
-// TestApplicationForInstance_NoAllowList_AllEmpty verifies the fail-closed
-// contract: when every candidate is empty, resolution fails (ok=false).
-func TestApplicationForInstance_NoAllowList_AllEmpty(t *testing.T) {
-	m := NewMapper(nil)
-	ins := mock.Instance{}
-
-	name, ok := m.ApplicationForInstance(ins)
-
-	if ok {
-		t.Errorf("expected ok=false for an empty instance (fail-closed), got ok=true")
-	}
-	if name != "" {
-		t.Errorf("got name=%q, want empty string when nothing resolves", name)
-	}
+// appWith builds an *Application with the given metadata name and resources.
+func appWith(name string, resources ...ResourceStatus) *Application {
+	a := &Application{}
+	a.Metadata.Name = name
+	a.Status.Resources = resources
+	return a
 }
 
 // -----------------------------------------------------------------------------
-// Resolution — with allow-list
-//
-// With a configured allow-list, only a candidate that exactly matches a
-// configured Application name is accepted. Configured order breaks ties.
+// Eligibility — the operator allow-list is the sole source of eligibility.
 // -----------------------------------------------------------------------------
 
-// TestApplicationForInstance_AllowList_Match verifies that a cluster candidate
-// matching a configured Application name resolves to that name.
-func TestApplicationForInstance_AllowList_Match(t *testing.T) {
-	m := NewMapper([]string{"foo-beta", "bar"})
-	ins := mock.Instance{App: "foo", Cluster: "foo-beta"}
-
-	name, ok := m.ApplicationForInstance(ins)
-
-	if !ok {
-		t.Fatalf("expected the cluster candidate to match a configured Application, got ok=false")
+// TestEligibility covers NewMapper normalization plus IsEligible / an empty
+// allow-list denying everything (the C-01 fix).
+func TestEligibility(t *testing.T) {
+	cases := []struct {
+		name       string
+		configured []string
+		query      string
+		wantElig   bool
+	}{
+		{"empty list denies any name", nil, "foo", false},
+		{"empty list denies empty query", nil, "", false},
+		{"exact match is eligible", []string{"foo", "bar"}, "foo", true},
+		{"non-member is ineligible", []string{"foo", "bar"}, "baz", false},
+		{"empty query is never eligible", []string{"foo"}, "", false},
+		{"whitespace in configured name is trimmed", []string{"  foo  "}, "foo", true},
+		{"whitespace in query is trimmed", []string{"foo"}, "  foo  ", true},
+		{"match is case-sensitive", []string{"Foo"}, "foo", false},
 	}
-	if got, want := name, "foo-beta"; got != want {
-		t.Errorf("got name=%q, want %q", got, want)
-	}
-}
-
-// TestApplicationForInstance_AllowList_MatchByApp verifies that the app
-// candidate resolves against the allow-list even when the cluster candidate
-// does not match any configured name.
-func TestApplicationForInstance_AllowList_MatchByApp(t *testing.T) {
-	m := NewMapper([]string{"foo"})
-	ins := mock.Instance{App: "foo", Cluster: "foo-beta"}
-
-	name, ok := m.ApplicationForInstance(ins)
-
-	if !ok {
-		t.Fatalf("expected the app candidate to match the configured Application, got ok=false")
-	}
-	if got, want := name, "foo"; got != want {
-		t.Errorf("got name=%q, want %q (cluster does not match, but app does)", got, want)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewMapper(tc.configured)
+			if got := m.IsEligible(tc.query); got != tc.wantElig {
+				t.Errorf("IsEligible(%q) with %v = %v, want %v", tc.query, tc.configured, got, tc.wantElig)
+			}
+		})
 	}
 }
 
-// TestApplicationForInstance_AllowList_NoMatch verifies the fail-closed hinge:
-// when no candidate matches any configured Application, resolution fails.
-func TestApplicationForInstance_AllowList_NoMatch(t *testing.T) {
-	m := NewMapper([]string{"other"})
-	ins := mock.Instance{App: "foo", Cluster: "foo-beta"}
-
-	name, ok := m.ApplicationForInstance(ins)
-
-	if ok {
-		t.Errorf("expected ok=false when no candidate matches the allow-list (fail-closed), got ok=true")
+// TestNewMapper_NormalizesAndDeduplicates verifies whitespace trimming, empty
+// dropping, de-duplication, and order preservation (the m-04/M-02 fix).
+func TestNewMapper_NormalizesAndDeduplicates(t *testing.T) {
+	m := NewMapper([]string{"  foo ", "", "bar", "foo", "   ", "bar", "baz"})
+	got := m.EligibleApplications()
+	want := []string{"foo", "bar", "baz"}
+	if len(got) != len(want) {
+		t.Fatalf("EligibleApplications() = %v, want %v", got, want)
 	}
-	if name != "" {
-		t.Errorf("got name=%q, want empty string on an allow-list miss", name)
-	}
-}
-
-// -----------------------------------------------------------------------------
-// Resolution — with InstanceGroup
-//
-// ApplicationFor additionally considers the group's app name as a candidate and
-// must tolerate a nil group without panicking.
-// -----------------------------------------------------------------------------
-
-// TestApplicationFor_GroupAppMatches verifies that the group's app name is used
-// as a resolution candidate when the instance's own identifiers are empty.
-func TestApplicationFor_GroupAppMatches(t *testing.T) {
-	m := NewMapper([]string{"bar"})
-	ins := mock.Instance{App: "", Cluster: ""}
-	g := grp.New("bar", "test", "us-east-1", "prod", "bar-prod")
-
-	name, ok := m.ApplicationFor(g, ins)
-
-	if !ok {
-		t.Fatalf("expected the group.App() candidate to resolve against the allow-list, got ok=false")
-	}
-	if got, want := name, "bar"; got != want {
-		t.Errorf("got name=%q, want %q", got, want)
-	}
-}
-
-// TestApplicationFor_NilGroupTolerated verifies that a nil InstanceGroup is
-// handled gracefully (no panic) and resolution falls back to the instance.
-func TestApplicationFor_NilGroupTolerated(t *testing.T) {
-	m := NewMapper(nil)
-	ins := mock.Instance{Cluster: "foo-beta"}
-
-	name, ok := m.ApplicationFor(nil, ins)
-
-	if !ok {
-		t.Fatalf("expected resolution to succeed via the instance's cluster, got ok=false")
-	}
-	if got, want := name, "foo-beta"; got != want {
-		t.Errorf("got name=%q, want %q (nil group must not affect fallback resolution)", got, want)
-	}
-}
-
-// -----------------------------------------------------------------------------
-// ManagedWorkloads — filtering status.resources[] to workload kinds
-//
-// Only workload kinds (Pod, Deployment, ReplicaSet, StatefulSet, DaemonSet,
-// Rollout) are returned; original order is preserved. An empty result backs the
-// gate's "manages no live resources" deny branch.
-// -----------------------------------------------------------------------------
-
-// TestManagedWorkloads_FiltersWorkloadKinds verifies that only workload kinds
-// are returned, in their original order, and that non-workload kinds (Service,
-// ConfigMap) are dropped.
-func TestManagedWorkloads_FiltersWorkloadKinds(t *testing.T) {
-	app := &Application{}
-	app.Status.Resources = []ResourceStatus{
-		{Kind: "Deployment", Name: "web"},
-		{Kind: "Pod", Name: "web-abc"},
-		{Kind: "Service", Name: "web-svc"},
-		{Kind: "ConfigMap", Name: "cfg"},
-	}
-
-	got := ManagedWorkloads(app)
-
-	// Guard the index accesses below from panicking on an unexpected result.
-	if len(got) != 2 {
-		t.Fatalf("got len(workloads)=%d, want 2 (only the Deployment and Pod are workload kinds)", len(got))
-	}
-	if got[0].Kind != "Deployment" || got[0].Name != "web" {
-		t.Errorf("got workloads[0]={Kind:%q, Name:%q}, want {Deployment, web} (order must be preserved)", got[0].Kind, got[0].Name)
-	}
-	if got[1].Kind != "Pod" || got[1].Name != "web-abc" {
-		t.Errorf("got workloads[1]={Kind:%q, Name:%q}, want {Pod, web-abc} (order must be preserved)", got[1].Kind, got[1].Name)
-	}
-}
-
-// TestManagedWorkloads_NilApp verifies that a nil Application yields nil.
-func TestManagedWorkloads_NilApp(t *testing.T) {
-	if got := ManagedWorkloads(nil); got != nil {
-		t.Errorf("got %v, want nil for a nil Application", got)
-	}
-}
-
-// TestManagedWorkloads_NoWorkloadKinds verifies that an Application managing
-// only non-workload kinds yields an empty result (the deny signal for
-// "manages no live resources").
-func TestManagedWorkloads_NoWorkloadKinds(t *testing.T) {
-	app := &Application{}
-	app.Status.Resources = []ResourceStatus{
-		{Kind: "Service", Name: "web-svc"},
-		{Kind: "ConfigMap", Name: "cfg"},
-	}
-
-	got := ManagedWorkloads(app)
-
-	if len(got) != 0 {
-		t.Errorf("got len(workloads)=%d, want 0 (no workload kinds present)", len(got))
-	}
-}
-
-// TestManagedWorkloads_AllWorkloadKinds confirms that every recognized workload
-// kind passes the filter, in the order supplied.
-func TestManagedWorkloads_AllWorkloadKinds(t *testing.T) {
-	app := &Application{}
-	app.Status.Resources = []ResourceStatus{
-		{Kind: "Deployment", Name: "d"},
-		{Kind: "StatefulSet", Name: "ss"},
-		{Kind: "DaemonSet", Name: "ds"},
-		{Kind: "ReplicaSet", Name: "rs"},
-		{Kind: "Rollout", Name: "ro"},
-		{Kind: "Pod", Name: "p"},
-	}
-
-	got := ManagedWorkloads(app)
-
-	wantKinds := []string{"Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Rollout", "Pod"}
-	if len(got) != len(wantKinds) {
-		t.Fatalf("got len(workloads)=%d, want %d (all workload kinds must pass the filter)", len(got), len(wantKinds))
-	}
-	for i, want := range wantKinds {
-		if got[i].Kind != want {
-			t.Errorf("got workloads[%d].Kind=%q, want %q (workload order must be preserved)", i, got[i].Kind, want)
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("EligibleApplications()[%d] = %q, want %q (order must be preserved)", i, got[i], want[i])
 		}
+	}
+}
+
+// TestEligibleApplications_ReturnsCopy verifies the accessor returns a copy so a
+// caller cannot mutate the Mapper's internal state (the m-04 aliasing fix).
+func TestEligibleApplications_ReturnsCopy(t *testing.T) {
+	m := NewMapper([]string{"foo", "bar"})
+	got := m.EligibleApplications()
+	got[0] = "mutated"
+	if !m.IsEligible("foo") || m.IsEligible("mutated") {
+		t.Errorf("mutating the returned slice changed Mapper state: IsEligible(foo)=%v IsEligible(mutated)=%v",
+			m.IsEligible("foo"), m.IsEligible("mutated"))
+	}
+}
+
+// TestNewMapper_DoesNotAliasInput verifies the constructor copies its input so
+// later caller mutation cannot change eligibility (the m-04 aliasing fix).
+func TestNewMapper_DoesNotAliasInput(t *testing.T) {
+	in := []string{"foo", "bar"}
+	m := NewMapper(in)
+	in[0] = "mutated"
+	if !m.IsEligible("foo") || m.IsEligible("mutated") {
+		t.Errorf("mutating the input slice changed Mapper state: IsEligible(foo)=%v IsEligible(mutated)=%v",
+			m.IsEligible("foo"), m.IsEligible("mutated"))
+	}
+}
+
+// TestEmptyAllowList_ManagedResourceForDenies is the headline C-01 safety
+// assertion: with no eligible Applications configured, even a perfectly
+// matching, healthy, live workload is denied.
+func TestEmptyAllowList_ManagedResourceForDenies(t *testing.T) {
+	m := NewMapper(nil)
+	app := appWith("foo", healthy("apps", "Deployment", "foo"))
+	ins := mock.Instance{App: "foo", Cluster: "foo"}
+	if _, ok := m.ManagedResourceFor(app, nil, ins); ok {
+		t.Error("empty allow-list must deny every target (fail-closed), got ok=true")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// ManagedResourceFor — authoritative, fail-closed ownership correlation.
+// -----------------------------------------------------------------------------
+
+func TestManagedResourceFor(t *testing.T) {
+	var nilInstance chaosmonkey.Instance
+	typedNil := chaosmonkey.Instance((*nilableInstance)(nil))
+
+	cases := []struct {
+		name       string
+		configured []string
+		app        *Application
+		group      grp.InstanceGroup
+		instance   chaosmonkey.Instance
+		wantOK     bool
+		wantName   string
+	}{
+		{
+			name:       "matching live Deployment by cluster name allows",
+			configured: []string{"foo"},
+			app:        appWith("foo", healthy("apps", "Deployment", "foo")),
+			instance:   mock.Instance{Cluster: "foo"},
+			wantOK:     true,
+			wantName:   "foo",
+		},
+		{
+			name:       "matching live Deployment by app name allows",
+			configured: []string{"foo"},
+			app:        appWith("foo", healthy("apps", "Deployment", "foo")),
+			instance:   mock.Instance{App: "foo", Cluster: ""},
+			wantOK:     true,
+			wantName:   "foo",
+		},
+		{
+			name:       "same-named but ineligible Application denies",
+			configured: []string{"bar"},
+			app:        appWith("foo", healthy("apps", "Deployment", "foo")),
+			instance:   mock.Instance{Cluster: "foo"},
+			wantOK:     false,
+		},
+		{
+			name:       "eligible Application not managing the target denies",
+			configured: []string{"foo"},
+			app:        appWith("foo", healthy("apps", "Deployment", "other")),
+			instance:   mock.Instance{Cluster: "foo"},
+			wantOK:     false,
+		},
+		{
+			name:       "only non-workload resources denies",
+			configured: []string{"foo"},
+			app:        appWith("foo", healthy("", "Service", "foo"), healthy("", "ConfigMap", "foo")),
+			instance:   mock.Instance{Cluster: "foo"},
+			wantOK:     false,
+		},
+		{
+			name:       "workload reported Missing denies",
+			configured: []string{"foo"},
+			app:        appWith("foo", withHealth("apps", "Deployment", "foo", HealthStatusMissing)),
+			instance:   mock.Instance{Cluster: "foo"},
+			wantOK:     false,
+		},
+		{
+			name:       "workload with absent health denies",
+			configured: []string{"foo"},
+			app:        appWith("foo", ResourceStatus{Group: "apps", Kind: "Deployment", Name: "foo"}),
+			instance:   mock.Instance{Cluster: "foo"},
+			wantOK:     false,
+		},
+		{
+			name:       "workload kind in wrong API group denies",
+			configured: []string{"foo"},
+			app:        appWith("foo", healthy("networking.k8s.io", "Deployment", "foo")),
+			instance:   mock.Instance{Cluster: "foo"},
+			wantOK:     false,
+		},
+		{
+			name:       "ambiguous multiple matching live workloads denies",
+			configured: []string{"foo"},
+			app:        appWith("foo", healthy("apps", "Deployment", "foo"), healthy("apps", "StatefulSet", "foo")),
+			instance:   mock.Instance{Cluster: "foo"},
+			wantOK:     false,
+		},
+		{
+			name:       "match via group app name allows",
+			configured: []string{"bar"},
+			app:        appWith("bar", healthy("apps", "Deployment", "bar")),
+			group:      grp.New("bar", "prod", "us-east-1", "", ""),
+			instance:   mock.Instance{},
+			wantOK:     true,
+			wantName:   "bar",
+		},
+		{
+			name:       "match via group cluster name allows",
+			configured: []string{"app1"},
+			app:        appWith("app1", healthy("apps", "StatefulSet", "app1-prod")),
+			group:      grp.New("app1", "prod", "us-east-1", "", "app1-prod"),
+			instance:   mock.Instance{},
+			wantOK:     true,
+			wantName:   "app1-prod",
+		},
+		{
+			name:       "nil Application denies",
+			configured: []string{"foo"},
+			app:        nil,
+			instance:   mock.Instance{Cluster: "foo"},
+			wantOK:     false,
+		},
+		{
+			name:       "nil instance denies",
+			configured: []string{"foo"},
+			app:        appWith("foo", healthy("apps", "Deployment", "foo")),
+			instance:   nilInstance,
+			wantOK:     false,
+		},
+		{
+			name:       "typed-nil instance denies without panic",
+			configured: []string{"foo"},
+			app:        appWith("foo", healthy("apps", "Deployment", "foo")),
+			instance:   typedNil,
+			wantOK:     false,
+		},
+		{
+			name:       "empty identifiers with nil group denies",
+			configured: []string{"foo"},
+			app:        appWith("foo", healthy("apps", "Deployment", "foo")),
+			instance:   mock.Instance{},
+			wantOK:     false,
+		},
+		{
+			name:       "live Pod in core group allows",
+			configured: []string{"foo"},
+			app:        appWith("foo", healthy("", "Pod", "foo")),
+			instance:   mock.Instance{Cluster: "foo"},
+			wantOK:     true,
+			wantName:   "foo",
+		},
+		{
+			name:       "live Rollout in argoproj.io group allows",
+			configured: []string{"foo"},
+			app:        appWith("foo", healthy("argoproj.io", "Rollout", "foo")),
+			instance:   mock.Instance{Cluster: "foo"},
+			wantOK:     true,
+			wantName:   "foo",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewMapper(tc.configured)
+			got, ok := m.ManagedResourceFor(tc.app, tc.group, tc.instance)
+			if ok != tc.wantOK {
+				t.Fatalf("ManagedResourceFor ok = %v, want %v (resource=%+v)", ok, tc.wantOK, got)
+			}
+			if ok && got.Name != tc.wantName {
+				t.Errorf("ManagedResourceFor resource name = %q, want %q", got.Name, tc.wantName)
+			}
+			if !ok && got.Name != "" {
+				t.Errorf("denied result must be the zero ResourceStatus, got name=%q", got.Name)
+			}
+		})
+	}
+}
+
+// -----------------------------------------------------------------------------
+// application.go predicates — nil-safety (M-04) and live-workload semantics (M-01)
+// -----------------------------------------------------------------------------
+
+// TestApplicationPredicates_NilReceiver verifies the *Application predicates are
+// nil-safe and fail closed (return false / nil) rather than panicking.
+func TestApplicationPredicates_NilReceiver(t *testing.T) {
+	var a *Application
+	if a.IsSynced() {
+		t.Error("nil *Application IsSynced() = true, want false")
+	}
+	if a.IsHealthy() {
+		t.Error("nil *Application IsHealthy() = true, want false")
+	}
+	if a.HasLiveResources() {
+		t.Error("nil *Application HasLiveResources() = true, want false")
+	}
+	if got := a.LiveWorkloads(); got != nil {
+		t.Errorf("nil *Application LiveWorkloads() = %v, want nil", got)
+	}
+}
+
+// TestIsSyncedIsHealthy_ExactEquality verifies only the exact Synced / Healthy
+// strings pass, so unknown/future values fail closed.
+func TestIsSyncedIsHealthy_ExactEquality(t *testing.T) {
+	cases := []struct {
+		sync, health           string
+		wantSynced, wantHealth bool
+	}{
+		{"Synced", "Healthy", true, true},
+		{"OutOfSync", "Degraded", false, false},
+		{"Synced", "Progressing", true, false},
+		{"", "", false, false},
+		{"Unknown", "Unknown", false, false},
+		{"synced", "healthy", false, false}, // case-sensitive
+	}
+	for _, tc := range cases {
+		a := &Application{}
+		a.Status.Sync.Status = tc.sync
+		a.Status.Health.Status = tc.health
+		if got := a.IsSynced(); got != tc.wantSynced {
+			t.Errorf("IsSynced(sync=%q) = %v, want %v", tc.sync, got, tc.wantSynced)
+		}
+		if got := a.IsHealthy(); got != tc.wantHealth {
+			t.Errorf("IsHealthy(health=%q) = %v, want %v", tc.health, got, tc.wantHealth)
+		}
+	}
+}
+
+// TestIsLiveWorkload verifies the GVK + liveness predicate (M-01).
+func TestIsLiveWorkload(t *testing.T) {
+	healthPtr := func(s string) *HealthStatus { return &HealthStatus{Status: s} }
+	cases := []struct {
+		name string
+		r    ResourceStatus
+		want bool
+	}{
+		{"healthy Deployment in apps", ResourceStatus{Group: "apps", Kind: "Deployment", Health: healthPtr(HealthStatusHealthy)}, true},
+		{"healthy Pod in core", ResourceStatus{Group: "", Kind: "Pod", Health: healthPtr(HealthStatusHealthy)}, true},
+		{"healthy Rollout in argoproj.io", ResourceStatus{Group: "argoproj.io", Kind: "Rollout", Health: healthPtr(HealthStatusHealthy)}, true},
+		{"progressing Deployment is still live", ResourceStatus{Group: "apps", Kind: "Deployment", Health: healthPtr(HealthStatusProgressing)}, true},
+		{"degraded Deployment is still live", ResourceStatus{Group: "apps", Kind: "Deployment", Health: healthPtr(HealthStatusDegraded)}, true},
+		{"missing Deployment is not live", ResourceStatus{Group: "apps", Kind: "Deployment", Health: healthPtr(HealthStatusMissing)}, false},
+		{"unknown Deployment is not live", ResourceStatus{Group: "apps", Kind: "Deployment", Health: healthPtr(HealthStatusUnknown)}, false},
+		{"absent health is not live", ResourceStatus{Group: "apps", Kind: "Deployment"}, false},
+		{"Service is not a workload", ResourceStatus{Group: "", Kind: "Service", Health: healthPtr(HealthStatusHealthy)}, false},
+		{"ConfigMap is not a workload", ResourceStatus{Group: "", Kind: "ConfigMap", Health: healthPtr(HealthStatusHealthy)}, false},
+		{"Deployment in wrong group is not a workload", ResourceStatus{Group: "extensions", Kind: "Deployment", Health: healthPtr(HealthStatusHealthy)}, false},
+		{"Pod in non-core group is not a workload", ResourceStatus{Group: "apps", Kind: "Pod", Health: healthPtr(HealthStatusHealthy)}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.r.IsLiveWorkload(); got != tc.want {
+				t.Errorf("IsLiveWorkload() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHasLiveResourcesAndLiveWorkloads verifies HasLiveResources requires a live
+// workload (not just any resource) and LiveWorkloads preserves order (M-01).
+func TestHasLiveResourcesAndLiveWorkloads(t *testing.T) {
+	app := appWith("x",
+		healthy("", "Service", "svc"),                                // not a workload
+		withHealth("apps", "Deployment", "web", HealthStatusMissing), // workload but not live
+		healthy("apps", "StatefulSet", "db"),                         // live workload
+		healthy("", "Pod", "web-abc"),                                // live workload
+	)
+	if !app.HasLiveResources() {
+		t.Error("HasLiveResources() = false, want true (app has live workloads)")
+	}
+	live := app.LiveWorkloads()
+	if len(live) != 2 {
+		t.Fatalf("LiveWorkloads() len = %d, want 2", len(live))
+	}
+	if live[0].Name != "db" || live[1].Name != "web-abc" {
+		t.Errorf("LiveWorkloads() = [%q,%q], want [db,web-abc] (order preserved)", live[0].Name, live[1].Name)
+	}
+
+	only := appWith("y", healthy("", "Service", "svc"), withHealth("apps", "Deployment", "web", HealthStatusMissing))
+	if only.HasLiveResources() {
+		t.Error("HasLiveResources() = true for Service-only + Missing workload, want false")
 	}
 }

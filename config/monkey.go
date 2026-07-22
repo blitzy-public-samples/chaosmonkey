@@ -329,12 +329,15 @@ func (m *Monkey) getStringSlice(key string) ([]string, error) {
 	// represents a list of strings, so we need to handle both cases
 	t := m.v.Get(key)
 	if t == nil {
-		return nil, fmt.Errorf("%s not specified", param.Accounts)
+		// Report the key that was actually requested rather than a hardcoded
+		// one, so diagnostics for e.g. argocd.applications are accurate.
+		// (Fixed for the Argo CD integration per code review m-06.)
+		return nil, fmt.Errorf("%s not specified", key)
 	}
 
 	switch t := t.(type) {
 	default:
-		return nil, fmt.Errorf("%s: unexpected type %T", param.Accounts, t)
+		return nil, fmt.Errorf("%s: unexpected type %T", key, t)
 	case []string: // When set explicitly in code
 		return t, nil
 	case []interface{}: // When reading from config file
@@ -397,7 +400,11 @@ func (m *Monkey) ArgoCDTokenFile() string { return m.v.GetString(param.ArgoCDTok
 // ArgoCDProject returns an optional Argo CD project name used to scope Application lookups.
 func (m *Monkey) ArgoCDProject() string { return m.v.GetString(param.ArgoCDProject) }
 
-// ArgoCDApplications returns the list of chaos-eligible Argo CD Application names/selectors.
+// ArgoCDApplications returns the list of chaos-eligible Argo CD Application
+// names. Each entry is an exact Application name (matched, after whitespace
+// trimming, against an Application's metadata.name); label-selector based
+// discovery via the Argo CD list API is a concern of the Argo CD client layer,
+// not this accessor. (Doc clarified for the Argo CD integration per code review M-02.)
 func (m *Monkey) ArgoCDApplications() ([]string, error) {
 	return m.getStringSlice(param.ArgoCDApplications)
 }
