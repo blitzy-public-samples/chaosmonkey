@@ -89,6 +89,17 @@ certificate = ""        # path to p12 file when using client-side tls certs
 encrypted_password = "" # password used for p12 certificate, encrypted by decryptor
 user = ""               # user associated with terminations, sent in API call to terminate
 
+[argocd]
+enabled = false               # if true, enable the Argo CD sync/health gate + annotation write-back
+endpoint = ""                 # Argo CD API server base URL, e.g. https://argocd.example.com
+token = ""                    # inline bearer token (JWT); prefer token_file in production
+token_file = ""               # path to a file containing the bearer token
+project = ""                  # optional Argo CD project used to scope Application lookups
+applications = []             # chaos-eligible Argo CD Application names/selectors
+insecure_skip_verify = false  # skip TLS verification to the Argo CD server
+ca_cert = ""                  # path to a PEM CA bundle to verify the Argo CD server cert
+timeout = 30                  # per-request timeout in seconds
+
 # For dynamic configuration options, see viper docs
 [dynamic]
 provider = ""   # options: "etcd", "consul"
@@ -98,3 +109,11 @@ path = ""       # path for dynamic provider
 
 Note that many of these configuration parameters (decryptor, trackers,
 error_counter, outage_checker) currently only have no-op implementations.
+
+To enable the optional Argo CD integration, set `argocd.enabled = true` and
+configure the `[argocd]` section above. The Argo CD sync/health gate then skips
+terminating any instance whose governing Argo CD `Application` is not both
+`Synced` and `Healthy`. To also record chaos actions back to Argo CD, activate
+the write-back by adding `"argocd"` to the `trackers` list (for example,
+`trackers = ["argocd"]`). See the [Argo CD plugin documentation](plugins/ArgoCD)
+for full details.

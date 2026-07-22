@@ -30,6 +30,17 @@ Chaos Monkey should work with any backend that Spinnaker supports (AWS, Google
 Compute Engine, Azure, Kubernetes, Cloud Foundry). It has been tested with
 AWS, [GCE][gce-blogpost], and Kubernetes.
 
+### Argo CD integration (optional)
+
+Chaos Monkey can optionally coordinate with [Argo CD] so it does not disrupt
+workloads that GitOps currently considers unstable. When enabled, Chaos Monkey
+skips terminating any instance whose governing Argo CD `Application` is not
+both `Synced` and `Healthy`, and it writes a best-effort annotation back to the
+`Application` so the chaos action appears in the Argo CD timeline. The feature
+is **opt-in and disabled by default**; when it is not configured, Chaos Monkey
+behaves exactly as before. See the [Argo CD plugin documentation][argocd-docs]
+for configuration details.
+
 ### Install locally
 
 To install the Chaos Monkey binary on your local machine:
@@ -49,3 +60,5 @@ See the [docs] for instructions on how to configure and deploy Chaos Monkey.
 [Spinnaker]: http://www.spinnaker.io/
 [docs]: https://netflix.github.io/chaosmonkey
 [gce-blogpost]: https://medium.com/continuous-delivery-scale/running-chaos-monkey-on-spinnaker-google-compute-engine-gce-155dc52f20ef
+[Argo CD]: https://argo-cd.readthedocs.io/
+[argocd-docs]: https://netflix.github.io/chaosmonkey/plugins/ArgoCD/
