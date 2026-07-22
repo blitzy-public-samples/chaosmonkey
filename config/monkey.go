@@ -73,6 +73,17 @@ func (m *Monkey) setDefaults() {
 	m.v.SetDefault(param.DynamicEndpoint, "")
 	m.v.SetDefault(param.DynamicPath, "")
 
+	// argocd (disabled by default; feature is inert unless explicitly enabled)
+	m.v.SetDefault(param.ArgoCDEnabled, false)
+	m.v.SetDefault(param.ArgoCDEndpoint, "")
+	m.v.SetDefault(param.ArgoCDToken, "")
+	m.v.SetDefault(param.ArgoCDTokenFile, "")
+	m.v.SetDefault(param.ArgoCDProject, "")
+	m.v.SetDefault(param.ArgoCDApplications, []string{})
+	m.v.SetDefault(param.ArgoCDInsecureSkipVerify, false)
+	m.v.SetDefault(param.ArgoCDCACert, "")
+	m.v.SetDefault(param.ArgoCDTimeout, 30) // seconds
+
 	m.v.SetDefault(param.ScheduleCronPath, "/etc/cron.d/chaosmonkey-schedule")
 	m.v.SetDefault(param.SchedulePath, "/apps/chaosmonkey/chaosmonkey-schedule.sh")
 	m.v.SetDefault(param.LogPath, "/var/log")
@@ -369,6 +380,36 @@ func (m *Monkey) SpinnakerX509Cert() string {
 func (m *Monkey) SpinnakerX509Key() string {
 	return m.v.GetString(param.SpinnakerX509Key)
 }
+
+// ArgoCDEnabled returns true if the Argo CD integration (pre-flight sync/health
+// gate and annotation write-back) is enabled. Added for the Argo CD integration.
+func (m *Monkey) ArgoCDEnabled() bool { return m.v.GetBool(param.ArgoCDEnabled) }
+
+// ArgoCDEndpoint returns the Argo CD API server base URL (e.g. https://argocd.example.com).
+func (m *Monkey) ArgoCDEndpoint() string { return m.v.GetString(param.ArgoCDEndpoint) }
+
+// ArgoCDToken returns the inline Argo CD bearer token (JWT). Prefer ArgoCDTokenFile in production.
+func (m *Monkey) ArgoCDToken() string { return m.v.GetString(param.ArgoCDToken) }
+
+// ArgoCDTokenFile returns a path to a file containing the Argo CD bearer token.
+func (m *Monkey) ArgoCDTokenFile() string { return m.v.GetString(param.ArgoCDTokenFile) }
+
+// ArgoCDProject returns an optional Argo CD project name used to scope Application lookups.
+func (m *Monkey) ArgoCDProject() string { return m.v.GetString(param.ArgoCDProject) }
+
+// ArgoCDApplications returns the list of chaos-eligible Argo CD Application names/selectors.
+func (m *Monkey) ArgoCDApplications() ([]string, error) {
+	return m.getStringSlice(param.ArgoCDApplications)
+}
+
+// ArgoCDInsecureSkipVerify reports whether TLS verification to the Argo CD server is skipped.
+func (m *Monkey) ArgoCDInsecureSkipVerify() bool { return m.v.GetBool(param.ArgoCDInsecureSkipVerify) }
+
+// ArgoCDCACert returns a path to a PEM CA bundle used to verify the Argo CD server certificate.
+func (m *Monkey) ArgoCDCACert() string { return m.v.GetString(param.ArgoCDCACert) }
+
+// ArgoCDTimeout returns the per-request timeout (in seconds) for Argo CD API calls.
+func (m *Monkey) ArgoCDTimeout() int { return m.v.GetInt(param.ArgoCDTimeout) }
 
 // Decryptor returns an interface for decrypting secrets
 func (m *Monkey) Decryptor() string {
