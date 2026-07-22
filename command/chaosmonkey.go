@@ -302,6 +302,15 @@ func Execute() {
 			log.Fatalf("FATAL: could not determine environment: %+v", err)
 		}
 
+		// Argo CD integration: resolve the additive pre-flight gate provider.
+		// Registered by the argocd package's init() (blank-imported in
+		// cmd/chaosmonkey/main.go); returns an allow-all provider when the
+		// feature is disabled, so this is safe even when [argocd] is unset.
+		precheck, err := deps.GetPrecheck(cfg)
+		if err != nil {
+			log.Fatalf("FATAL: could not create argocd precheck: %+v", err)
+		}
+
 		defer logOnPanic(errCounter) // Handler in case of panic
 		deps := deps.Deps{
 			MonkeyCfg:  cfg,
@@ -312,6 +321,7 @@ func Execute() {
 			T:          spin,
 			Trackers:   trackers,
 			Ou:         outage,
+			Precheck:   precheck,
 			ErrCounter: errCounter,
 			Env:        env,
 		}

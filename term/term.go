@@ -144,6 +144,22 @@ func doTerminate(d deps.Deps, group grp.InstanceGroup) error {
 
 	log.Printf("Picked: %s", instance)
 
+	// Argo CD integration: additive, nil-guarded pre-flight gate evaluated after
+	// the target instance is selected and before the min-time check. A nil
+	// provider means allow-all, so existing behavior is preserved when the
+	// feature is unconfigured. Fail-closed: a gate error or a denial results in
+	// NOT terminating (mirrors the outage-check safe path above).
+	if d.Precheck != nil {
+		allowed, reason, err := d.Precheck.Allow(group, instance)
+		if err != nil {
+			return errors.Wrap(err, "not terminating: argocd precheck failed")
+		}
+		if !allowed {
+			log.Printf("not terminating: %s", reason)
+			return nil
+		}
+	}
+
 	loc, err := d.MonkeyCfg.Location()
 	if err != nil {
 		return errors.Wrap(err, "not terminating: could not retrieve location")
