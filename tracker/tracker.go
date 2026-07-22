@@ -17,6 +17,7 @@ package tracker
 
 import (
 	"github.com/Netflix/chaosmonkey/v2"
+	"github.com/Netflix/chaosmonkey/v2/argocd"
 	"github.com/Netflix/chaosmonkey/v2/config"
 	"github.com/Netflix/chaosmonkey/v2/deps"
 	"github.com/pkg/errors"
@@ -51,6 +52,9 @@ func getTracker(kind string, cfg *config.Monkey) (chaosmonkey.Tracker, error) {
 	switch kind {
 	// As trackers are contributed to the open source project, they should
 	// be instantiated here
+	case "argocd":
+		// Argo CD integration: best-effort annotation write-back tracker.
+		return argocd.NewTracker(cfg)
 	default:
 		return nil, errors.Errorf("unsupported tracker: %s", kind)
 	}

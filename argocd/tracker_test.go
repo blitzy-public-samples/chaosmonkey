@@ -14,27 +14,38 @@
 
 package argocd
 
-// White-box, table-driven tests for tracker.go. They lock in the best-effort,
-// non-blocking write-back contract that Capability C depends on:
+// White-box unit tests for tracker.go. They are the executable proof of the
+// best-effort, NON-BLOCKING write-back contract (AAP 0.5.3): argoTracker.Track
+// MUST return nil on success AND on every failure mode (server 5xx/4xx,
+// unreachable endpoint, unresolved Application, nil client), because
+// term.doTerminate treats a tracker error as fatal to a termination that has
+// already been recorded. NewTracker is likewise lenient: it must NEVER return a
+// non-nil error, degrading instead to a safe no-op tracker. The success path
+// additionally asserts the write-back payload: a PATCH carrying the
+// chaosmonkey.netflix.com/last-termination annotation whose value JSON-decodes
+// to {instance, time, leashed} — the record that surfaces the chaos action on
+// the Argo CD timeline (User Example Flow 2).
 //
-//   - Track ALWAYS returns nil — on success and on EVERY failure mode (server
-//     5xx/4xx, unreachable endpoint, unresolved Application, nil client,
-//     nil/typed-nil instance) — because term.doTerminate treats a tracker error
-//     as fatal to a termination that has already been recorded;
-//   - on success the PATCH carries the chaosmonkey.netflix.com/last-termination
-//     annotation whose value JSON-decodes to {instance, time, leashed};
-//   - NewTracker is lenient: it never returns a non-nil error and degrades to a
-//     no-op tracker on any configuration/client problem;
-//   - a nil/typed-nil instance short-circuits before any HTTP call.
+// Framework: these tests use ONLY the standard-library testing and
+// net/http/httptest packages, matching every other test in this module. testify
+// is not imported anywhere in the repository; it appears in go.mod solely as an
+// // indirect requirement, so importing it directly here would promote it to a
+// direct dependency under `go mod tidy` and change go.mod — which the feature's
+// minimal-change contract forbids. Plain testing is therefore the required
+// choice (the plan's explicit fallback when testify would force a go.mod/go.sum
+// change).
 //
-// The tests use only the standard-library testing and net/http/httptest
-// packages with a table-driven style, matching the rest of the repository's
-// test suite (testify is not used anywhere in the module). The typed-nil helper
-// type nilableInstance is declared in mapper_test.go (same package).
+// Adaptation note: the delivered target-resolution engine (mapper.go) is
+// fail-closed and binds ownership to an Application's authoritative
+// status.resources[] inventory — it never infers ownership from a bare
+// Application-name coincidence, and an empty eligibility allow-list resolves
+// NOTHING. The success/error tests therefore configure argocd.enabled, an
+// endpoint, a (fake) token, and an explicit argocd.applications allow-list, and
+// serve an Application whose resources map to the target, so a real PATCH
+// write-back is exercised end-to-end through the public NewTracker constructor.
 
 import (
 	"encoding/json"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -48,43 +59,117 @@ import (
 )
 
 // argoTracker must satisfy the chaosmonkey.Tracker contract that the tracker
-// factory (case "argocd") and the termination loop depend on.
+// factory (case "argocd") and term.doTerminate's tracker loop depend on.
 var _ chaosmonkey.Tracker = argoTracker{}
 
-// resolvableAppJSON is the GET /api/v1/applications/myapp response body for an
-// Application named "myapp" that manages exactly one live Deployment workload
-// also named "myapp". It resolves mock.Instance{Cluster:"myapp"} to "myapp"
-// through Mapper.ManagedResourceFor.
+// resolvableAppJSON is the GET /api/v1/applications/my-app response for an
+// Application named "my-app" that manages exactly one live Deployment workload
+// also named "my-app". Through Mapper.ManagedResourceFor it resolves a target
+// whose cluster (or app) identifier is "my-app", so a write-back PATCH follows.
 const resolvableAppJSON = `{
-  "metadata": {"name": "myapp"},
+  "metadata": {"name": "my-app"},
   "status": {
     "sync":   {"status": "Synced"},
     "health": {"status": "Healthy"},
     "resources": [
-      {"group": "apps", "kind": "Deployment", "name": "myapp", "health": {"status": "Healthy"}}
+      {"group": "apps", "kind": "Deployment", "name": "my-app", "health": {"status": "Healthy"}}
     ]
   }
 }`
 
-// patchCapture records the most recent PATCH request body seen by a test server.
-// It is mutex-guarded so the assertion (after Track returns) is race-clean.
-type patchCapture struct {
-	mu   sync.Mutex
-	got  bool
-	body []byte
+// otherAppJSON is an eligible-but-non-matching Application: it is named "other"
+// and manages only a workload named "other", so it can never own a target whose
+// identifiers are {my-app, foo}. It is used to prove resolution denial without
+// any name-coincidence shortcut.
+const otherAppJSON = `{
+  "metadata": {"name": "other"},
+  "status": {
+    "sync":   {"status": "Synced"},
+    "health": {"status": "Healthy"},
+    "resources": [
+      {"group": "apps", "kind": "Deployment", "name": "other", "health": {"status": "Healthy"}}
+    ]
+  }
+}`
+
+// fixedTerminationTimeRFC3339 is the RFC3339 rendering of the deterministic
+// termination timestamp used by the payload assertion.
+const fixedTerminationTimeRFC3339 = "2023-01-02T03:04:05Z"
+
+// fixedTerminationTime returns the deterministic termination timestamp; its
+// RFC3339 form is exactly fixedTerminationTimeRFC3339.
+func fixedTerminationTime() time.Time {
+	return time.Date(2023, time.January, 2, 3, 4, 5, 0, time.UTC)
 }
 
-// snapshot returns whether a PATCH was seen and its captured body.
-func (c *patchCapture) snapshot() (bool, []byte) {
+// stdTermination is the canonical termination used across these tests: instance
+// i-123 in cluster "my-app" (app "foo"), terminated at the fixed time, not
+// leashed. The chaosmonkey.Termination type carries no termination identifier,
+// so the instance id is the subject recorded in the annotation.
+func stdTermination() chaosmonkey.Termination {
+	return chaosmonkey.Termination{
+		Instance: mock.Instance{App: "foo", Cluster: "my-app", InstanceID: "i-123"},
+		Time:     fixedTerminationTime(),
+		Leashed:  false,
+	}
+}
+
+// capturedPatch is a mutex-free snapshot of a recorded PATCH request, safe to
+// copy and inspect after Track returns.
+type capturedPatch struct {
+	seen        bool
+	method      string
+	path        string
+	contentType string
+	annotations map[string]string
+}
+
+// patchCapture records the annotation write-back (PATCH) request observed by a
+// test server. Only PATCH requests are recorded; the GET issued during target
+// resolution is answered but not captured, so a write-back that never happens
+// leaves the capture empty (seen == false). It is mutex-guarded so an assertion
+// made after Track returns is race-clean even though httptest serves each
+// request on its own goroutine.
+type patchCapture struct {
+	mu          sync.Mutex
+	seen        bool
+	method      string
+	path        string
+	contentType string
+	annotations map[string]string
+}
+
+// record stores the observed PATCH request under the lock.
+func (c *patchCapture) record(method, path, contentType string, annotations map[string]string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.got, c.body
+	c.seen = true
+	c.method = method
+	c.path = path
+	c.contentType = contentType
+	c.annotations = annotations
 }
 
-// newServer returns an httptest server that answers GET with getStatus (serving
-// getBody when 200) and PATCH with patchStatus (recording the body into cap when
-// cap is non-nil). It mimics the subset of the Argo CD REST API the tracker uses.
-func newServer(getStatus int, getBody string, patchStatus int, cap *patchCapture) *httptest.Server {
+// snapshot returns a race-clean, lock-free copy of the captured PATCH state.
+func (c *patchCapture) snapshot() capturedPatch {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return capturedPatch{
+		seen:        c.seen,
+		method:      c.method,
+		path:        c.path,
+		contentType: c.contentType,
+		annotations: c.annotations,
+	}
+}
+
+// newServer returns an httptest.Server that emulates the subset of the Argo CD
+// REST API the tracker uses. A GET (target resolution) is answered with getBody
+// when getStatus is 200, or with a bare getStatus otherwise. A PATCH (annotation
+// write-back) is answered with patchStatus and, when pc is non-nil, its method,
+// path, JSON merge-patch Content-Type, and decoded metadata.annotations are
+// recorded into pc. Any other method yields 405.
+func newServer(getStatus int, getBody string, patchStatus int, pc *patchCapture) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
@@ -95,12 +180,17 @@ func newServer(getStatus int, getBody string, patchStatus int, cap *patchCapture
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(getBody))
 		case http.MethodPatch:
-			body, _ := ioutil.ReadAll(r.Body)
-			if cap != nil {
-				cap.mu.Lock()
-				cap.got = true
-				cap.body = body
-				cap.mu.Unlock()
+			// Decode the JSON merge patch straight from the request body. A
+			// decode error simply leaves the annotations map nil, which the
+			// success assertion would then catch.
+			var body struct {
+				Metadata struct {
+					Annotations map[string]string `json:"annotations"`
+				} `json:"metadata"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if pc != nil {
+				pc.record(r.Method, r.URL.Path, r.Header.Get("Content-Type"), body.Metadata.Annotations)
 			}
 			w.WriteHeader(patchStatus)
 		default:
@@ -109,8 +199,24 @@ func newServer(getStatus int, getBody string, patchStatus int, cap *patchCapture
 	}))
 }
 
+// enabledMonkey returns a Chaos Monkey configuration with the Argo CD write-back
+// fully enabled, pointed at endpoint, with the supplied eligible-Application
+// allow-list and an obvious fake bearer token (never a real credential).
+// argocd.enabled is required because configFromMonkey is fail-closed: with the
+// feature disabled it returns an inert snapshot and the tracker degrades to a
+// nil-client no-op that never performs a write-back.
+func enabledMonkey(endpoint string, applications []string) *config.Monkey {
+	m := config.Defaults()
+	m.Set(param.ArgoCDEnabled, true)
+	m.Set(param.ArgoCDEndpoint, endpoint)
+	m.Set(param.ArgoCDToken, "test-token")
+	m.Set(param.ArgoCDApplications, applications)
+	return m
+}
+
 // mustClient builds a real Argo CD Client aimed at endpoint. It sets the
 // unexported token field directly (white-box) so no live auth is required.
+// This shared helper is also relied upon by precheck_test.go.
 func mustClient(t *testing.T, endpoint string, apps []string) *Client {
 	t.Helper()
 	c := Config{
@@ -127,69 +233,69 @@ func mustClient(t *testing.T, endpoint string, apps []string) *Client {
 	return client
 }
 
-// TestTrack_SuccessWritesAnnotation verifies the happy path: Track returns nil
-// and PATCHes the last-termination annotation whose value decodes to the
-// {instance, time, leashed} of the Termination.
-func TestTrack_SuccessWritesAnnotation(t *testing.T) {
-	cap := &patchCapture{}
-	srv := newServer(http.StatusOK, resolvableAppJSON, http.StatusOK, cap)
+// TestTrack_Success_WritesAnnotation proves the happy path: Track returns nil
+// and issues a PATCH that records the chaosmonkey.netflix.com/last-termination
+// annotation whose value decodes to the termination's {instance, time, leashed}.
+func TestTrack_Success_WritesAnnotation(t *testing.T) {
+	pc := &patchCapture{}
+	srv := newServer(http.StatusOK, resolvableAppJSON, http.StatusOK, pc)
 	defer srv.Close()
 
-	tr := argoTracker{
-		client:  mustClient(t, srv.URL, []string{"myapp"}),
-		mapper:  NewMapper([]string{"myapp"}),
-		timeout: 5 * time.Second,
+	tr, err := NewTracker(enabledMonkey(srv.URL, []string{"my-app"}))
+	if err != nil {
+		t.Fatalf("NewTracker returned error %v, want nil", err)
 	}
 
-	when := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
-	trm := chaosmonkey.Termination{
-		Instance: mock.Instance{Cluster: "myapp", InstanceID: "i-123"},
-		Time:     when,
-		Leashed:  true,
+	// The single acceptable Track return is nil, on success as on failure.
+	if err := tr.Track(stdTermination()); err != nil {
+		t.Fatalf("Track returned %v, want nil (write-back must never fail a termination)", err)
 	}
 
-	if err := tr.Track(trm); err != nil {
-		t.Fatalf("Track returned non-nil error %v; it must always return nil", err)
+	got := pc.snapshot()
+	if !got.seen {
+		t.Fatal("expected a PATCH annotation write-back, but the server received none")
+	}
+	if got.method != http.MethodPatch {
+		t.Errorf("write-back method = %q, want %q", got.method, http.MethodPatch)
+	}
+	if want := "/api/v1/applications/my-app"; got.path != want {
+		t.Errorf("write-back path = %q, want %q", got.path, want)
+	}
+	if want := "application/merge-patch+json"; got.contentType != want {
+		t.Errorf("write-back Content-Type = %q, want %q", got.contentType, want)
 	}
 
-	got, body := cap.snapshot()
-	if !got {
-		t.Fatal("expected a PATCH annotation write, but the server received none")
-	}
-
-	var patch struct {
-		Metadata struct {
-			Annotations map[string]string `json:"annotations"`
-		} `json:"metadata"`
-	}
-	if err := json.Unmarshal(body, &patch); err != nil {
-		t.Fatalf("could not decode PATCH body %q: %v", string(body), err)
-	}
-
-	raw, ok := patch.Metadata.Annotations[annotationKey]
+	raw, ok := got.annotations[annotationKey]
 	if !ok {
-		t.Fatalf("PATCH did not carry annotation %q; annotations=%v", annotationKey, patch.Metadata.Annotations)
+		t.Fatalf("PATCH did not carry annotation %q; annotations=%v", annotationKey, got.annotations)
 	}
 
-	var ann terminationAnnotation
+	// The annotation value is itself a compact JSON document; assert it against
+	// the terminated instance's id, RFC3339 time, and leashed flag.
+	var ann struct {
+		Instance string `json:"instance"`
+		Time     string `json:"time"`
+		Leashed  bool   `json:"leashed"`
+	}
 	if err := json.Unmarshal([]byte(raw), &ann); err != nil {
 		t.Fatalf("annotation value %q is not valid JSON: %v", raw, err)
 	}
 	if ann.Instance != "i-123" {
-		t.Errorf("annotation Instance = %q, want %q", ann.Instance, "i-123")
+		t.Errorf("annotation instance = %q, want %q", ann.Instance, "i-123")
 	}
-	if want := when.Format(time.RFC3339); ann.Time != want {
-		t.Errorf("annotation Time = %q, want %q", ann.Time, want)
+	if ann.Time != fixedTerminationTimeRFC3339 {
+		t.Errorf("annotation time = %q, want %q", ann.Time, fixedTerminationTimeRFC3339)
 	}
-	if !ann.Leashed {
-		t.Errorf("annotation Leashed = %v, want true", ann.Leashed)
+	if ann.Leashed {
+		t.Errorf("annotation leashed = %v, want false", ann.Leashed)
 	}
 }
 
-// TestTrack_ServerErrorsStillReturnNil verifies Track swallows every HTTP-status
-// failure — whether resolution (GET) or the annotation write (PATCH) fails — and
-// still returns nil.
-func TestTrack_ServerErrorsStillReturnNil(t *testing.T) {
+// TestTrack_ServerError_ReturnsNil proves Track swallows every HTTP-status
+// failure — whether target resolution (GET) or the annotation write (PATCH)
+// fails — and still returns nil, so a write-back error can never fail a
+// termination.
+func TestTrack_ServerError_ReturnsNil(t *testing.T) {
 	cases := []struct {
 		name        string
 		getStatus   int
@@ -198,218 +304,132 @@ func TestTrack_ServerErrorsStillReturnNil(t *testing.T) {
 		{"GET 500 fails resolution", http.StatusInternalServerError, http.StatusOK},
 		{"GET 404 missing application", http.StatusNotFound, http.StatusOK},
 		{"GET 403 forbidden", http.StatusForbidden, http.StatusOK},
-		{"PATCH 500 write fails", http.StatusOK, http.StatusInternalServerError},
-		{"PATCH 409 conflict", http.StatusOK, http.StatusConflict},
+		{"PATCH 500 write-back fails", http.StatusOK, http.StatusInternalServerError},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := newServer(tc.getStatus, resolvableAppJSON, tc.patchStatus, nil)
 			defer srv.Close()
 
-			tr := argoTracker{
-				client:  mustClient(t, srv.URL, []string{"myapp"}),
-				mapper:  NewMapper([]string{"myapp"}),
-				timeout: 5 * time.Second,
+			tr, err := NewTracker(enabledMonkey(srv.URL, []string{"my-app"}))
+			if err != nil {
+				t.Fatalf("NewTracker returned error %v, want nil", err)
 			}
-			trm := chaosmonkey.Termination{
-				Instance: mock.Instance{Cluster: "myapp", InstanceID: "i-1"},
-				Time:     time.Now(),
-			}
-			if err := tr.Track(trm); err != nil {
+			if err := tr.Track(stdTermination()); err != nil {
 				t.Fatalf("Track returned %v, want nil", err)
 			}
 		})
 	}
 }
 
-// TestTrack_UnreachableEndpointReturnsNil verifies that a dead endpoint (server
-// closed) causes resolution to fail and Track to return nil.
-func TestTrack_UnreachableEndpointReturnsNil(t *testing.T) {
+// TestTrack_Unreachable_ReturnsNil proves that when the Argo CD endpoint is
+// unreachable (the server has been closed, so connections are refused) target
+// resolution fails and Track still returns nil.
+func TestTrack_Unreachable_ReturnsNil(t *testing.T) {
 	srv := newServer(http.StatusOK, resolvableAppJSON, http.StatusOK, nil)
-	url := srv.URL
-	srv.Close() // now unreachable
+	deadURL := srv.URL
+	srv.Close() // connections to deadURL are now refused
 
-	tr := argoTracker{
-		client:  mustClient(t, url, []string{"myapp"}),
-		mapper:  NewMapper([]string{"myapp"}),
-		timeout: 1 * time.Second,
+	tr, err := NewTracker(enabledMonkey(deadURL, []string{"my-app"}))
+	if err != nil {
+		t.Fatalf("NewTracker returned error %v, want nil", err)
 	}
-	trm := chaosmonkey.Termination{
-		Instance: mock.Instance{Cluster: "myapp", InstanceID: "i-1"},
-		Time:     time.Now(),
-	}
-	if err := tr.Track(trm); err != nil {
+	if err := tr.Track(stdTermination()); err != nil {
 		t.Fatalf("Track against an unreachable endpoint returned %v, want nil", err)
 	}
 }
 
-// TestTrack_UnresolvedApplicationReturnsNil verifies Track returns nil when no
-// governing Application can be resolved: an empty eligible list, and an eligible
-// Application whose resources do not include the target.
-func TestTrack_UnresolvedApplicationReturnsNil(t *testing.T) {
-	t.Run("empty eligible list", func(t *testing.T) {
-		srv := newServer(http.StatusOK, resolvableAppJSON, http.StatusOK, nil)
-		defer srv.Close()
-
-		tr := argoTracker{
-			client:  mustClient(t, srv.URL, nil),
-			mapper:  NewMapper(nil), // no eligible applications
-			timeout: 5 * time.Second,
-		}
-		trm := chaosmonkey.Termination{
-			Instance: mock.Instance{Cluster: "myapp", InstanceID: "i-1"},
-			Time:     time.Now(),
-		}
-		if err := tr.Track(trm); err != nil {
-			t.Fatalf("Track with empty eligible list returned %v, want nil", err)
-		}
-	})
-
-	t.Run("eligible application does not manage the instance", func(t *testing.T) {
-		const otherApp = `{"metadata":{"name":"myapp"},"status":{"resources":[` +
-			`{"group":"apps","kind":"Deployment","name":"someone-else","health":{"status":"Healthy"}}]}}`
-		srv := newServer(http.StatusOK, otherApp, http.StatusOK, nil)
-		defer srv.Close()
-
-		tr := argoTracker{
-			client:  mustClient(t, srv.URL, []string{"myapp"}),
-			mapper:  NewMapper([]string{"myapp"}),
-			timeout: 5 * time.Second,
-		}
-		trm := chaosmonkey.Termination{
-			Instance: mock.Instance{Cluster: "myapp", InstanceID: "i-1"},
-			Time:     time.Now(),
-		}
-		if err := tr.Track(trm); err != nil {
-			t.Fatalf("Track for a non-managing Application returned %v, want nil", err)
-		}
-	})
-}
-
-// TestTrack_NilClientReturnsNil verifies that a tracker with no client (the
-// disabled/degraded no-op) returns nil without touching the network.
-func TestTrack_NilClientReturnsNil(t *testing.T) {
-	var tr argoTracker // zero value: client is nil
-	trm := chaosmonkey.Termination{
-		Instance: mock.Instance{Cluster: "myapp", InstanceID: "i-1"},
-		Time:     time.Now(),
-	}
-	if err := tr.Track(trm); err != nil {
-		t.Fatalf("Track with a nil client returned %v, want nil", err)
-	}
-}
-
-// TestTrack_NilInstanceReturnsNil verifies both an untyped-nil and a typed-nil
-// instance short-circuit before any HTTP call and return nil.
-func TestTrack_NilInstanceReturnsNil(t *testing.T) {
-	var mu sync.Mutex
-	hit := false
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		hit = true
-		mu.Unlock()
-		w.WriteHeader(http.StatusOK)
-	}))
+// TestTrack_UnresolvedApplication_ReturnsNil proves that when no governing
+// Application can be resolved for the target — here the only eligible
+// Application ("other") does not manage the terminated instance — Track returns
+// nil and performs NO write-back PATCH (the capture stays empty). Resolution is
+// bound to the Application's authoritative status.resources[] inventory, so a
+// non-matching eligible Application is correctly rejected before any write.
+func TestTrack_UnresolvedApplication_ReturnsNil(t *testing.T) {
+	pc := &patchCapture{}
+	srv := newServer(http.StatusOK, otherAppJSON, http.StatusOK, pc)
 	defer srv.Close()
 
-	tr := argoTracker{
-		client:  mustClient(t, srv.URL, []string{"myapp"}),
-		mapper:  NewMapper([]string{"myapp"}),
-		timeout: 5 * time.Second,
+	// The eligible allow-list is ["other"], but the termination targets cluster
+	// "my-app"/app "foo", which "other" does not manage.
+	tr, err := NewTracker(enabledMonkey(srv.URL, []string{"other"}))
+	if err != nil {
+		t.Fatalf("NewTracker returned error %v, want nil", err)
 	}
-
-	cases := []struct {
-		name     string
-		instance chaosmonkey.Instance
-	}{
-		{"untyped-nil instance", nil},
-		// nilableInstance is declared in mapper_test.go (same package); a typed
-		// nil pointer satisfies chaosmonkey.Instance but would panic if a method
-		// were invoked, proving the isNilInstance guard protects the scheduler.
-		{"typed-nil instance", chaosmonkey.Instance((*nilableInstance)(nil))},
+	if err := tr.Track(stdTermination()); err != nil {
+		t.Fatalf("Track for an unresolved Application returned %v, want nil", err)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			trm := chaosmonkey.Termination{Instance: tc.instance, Time: time.Now()}
-			if err := tr.Track(trm); err != nil {
-				t.Fatalf("Track with a %s returned %v, want nil", tc.name, err)
-			}
-		})
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if hit {
-		t.Error("Track made an HTTP call despite a nil instance; the nil guard must short-circuit")
+	if got := pc.snapshot(); got.seen {
+		t.Errorf("expected NO write-back PATCH when resolution fails, but the server recorded one: %+v", got)
 	}
 }
 
-// TestNewTracker_IsLenient verifies NewTracker never returns a non-nil error and
-// degrades to a no-op tracker on configuration problems, while still building a
-// working tracker from a complete, enabled configuration.
-func TestNewTracker_IsLenient(t *testing.T) {
-	t.Run("disabled config yields a no-op tracker and nil error", func(t *testing.T) {
-		m := config.Defaults() // argocd.enabled defaults to false
-		tr, err := NewTracker(m)
+// TestTrack_NilClient_ReturnsNil proves that a tracker built from a disabled /
+// unconfigured configuration has a nil client and treats Track as an immediate
+// no-op that returns nil without touching the network.
+func TestTrack_NilClient_ReturnsNil(t *testing.T) {
+	// config.Defaults() leaves argocd.enabled false and sets no endpoint, so
+	// NewTracker builds an inert tracker whose client is nil.
+	tr, err := NewTracker(config.Defaults())
+	if err != nil {
+		t.Fatalf("NewTracker returned error %v, want nil", err)
+	}
+	if err := tr.Track(stdTermination()); err != nil {
+		t.Fatalf("Track on a nil-client (disabled) tracker returned %v, want nil", err)
+	}
+}
+
+// TestNewTracker_NeverErrors proves NewTracker is lenient: it returns a nil
+// error for a disabled configuration and for every configuration/client
+// construction problem, degrading to a safe no-op tracker instead of surfacing
+// an error to the tracker factory (which would otherwise abort the entire
+// terminate run). In every case the returned tracker's Track is also a safe
+// no-op that returns nil.
+func TestNewTracker_NeverErrors(t *testing.T) {
+	t.Run("disabled default configuration", func(t *testing.T) {
+		tr, err := NewTracker(config.Defaults())
 		if err != nil {
 			t.Fatalf("NewTracker returned error %v, want nil", err)
 		}
 		if tr == nil {
 			t.Fatal("NewTracker returned a nil tracker")
 		}
-		trm := chaosmonkey.Termination{
-			Instance: mock.Instance{Cluster: "x", InstanceID: "i"},
-			Time:     time.Now(),
-		}
-		if err := tr.Track(trm); err != nil {
+		if err := tr.Track(stdTermination()); err != nil {
 			t.Fatalf("disabled tracker Track returned %v, want nil", err)
 		}
 	})
 
-	t.Run("enabled but missing token degrades and returns nil error", func(t *testing.T) {
+	t.Run("enabled but client build fails (bad ca_cert) degrades", func(t *testing.T) {
 		m := config.Defaults()
 		m.Set(param.ArgoCDEnabled, true)
-		m.Set(param.ArgoCDEndpoint, "https://argocd.example.com")
-		m.Set(param.ArgoCDApplications, []string{"myapp"})
+		m.Set(param.ArgoCDEndpoint, "https://argocd.example")
+		m.Set(param.ArgoCDToken, "test-token")
+		// A non-existent CA bundle makes NewClient fail; NewTracker must log and
+		// degrade to a no-op rather than return the error.
+		m.Set(param.ArgoCDCACert, "/nonexistent/ca.pem")
+
+		tr, err := NewTracker(m)
+		if err != nil {
+			t.Fatalf("NewTracker returned error %v, want nil (it must be lenient)", err)
+		}
+		if err := tr.Track(stdTermination()); err != nil {
+			t.Fatalf("degraded tracker Track returned %v, want nil", err)
+		}
+	})
+
+	t.Run("enabled but missing token degrades", func(t *testing.T) {
+		m := config.Defaults()
+		m.Set(param.ArgoCDEnabled, true)
+		m.Set(param.ArgoCDEndpoint, "https://argocd.example")
+		m.Set(param.ArgoCDApplications, []string{"my-app"})
 		// No token / token_file: configFromMonkey errors, and NewTracker must
 		// degrade to a no-op rather than surface the error to the factory.
 		tr, err := NewTracker(m)
 		if err != nil {
 			t.Fatalf("NewTracker returned error %v, want nil (it must be lenient)", err)
 		}
-		trm := chaosmonkey.Termination{
-			Instance: mock.Instance{Cluster: "myapp", InstanceID: "i"},
-			Time:     time.Now(),
-		}
-		if err := tr.Track(trm); err != nil {
+		if err := tr.Track(stdTermination()); err != nil {
 			t.Fatalf("degraded tracker Track returned %v, want nil", err)
-		}
-	})
-
-	t.Run("complete enabled config builds a working tracker", func(t *testing.T) {
-		cap := &patchCapture{}
-		srv := newServer(http.StatusOK, resolvableAppJSON, http.StatusOK, cap)
-		defer srv.Close()
-
-		m := config.Defaults()
-		m.Set(param.ArgoCDEnabled, true)
-		m.Set(param.ArgoCDEndpoint, srv.URL)
-		m.Set(param.ArgoCDToken, "test-token")
-		m.Set(param.ArgoCDApplications, []string{"myapp"})
-
-		tr, err := NewTracker(m)
-		if err != nil {
-			t.Fatalf("NewTracker returned error %v, want nil", err)
-		}
-		trm := chaosmonkey.Termination{
-			Instance: mock.Instance{Cluster: "myapp", InstanceID: "i-9"},
-			Time:     time.Now(),
-		}
-		if err := tr.Track(trm); err != nil {
-			t.Fatalf("Track returned %v, want nil", err)
-		}
-		if got, _ := cap.snapshot(); !got {
-			t.Error("expected the NewTracker-built tracker to write an annotation on success")
 		}
 	})
 }
