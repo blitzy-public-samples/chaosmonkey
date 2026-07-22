@@ -41,6 +41,11 @@ var (
 	// GetOutage returns an interface for checking if there is an outage
 	GetOutage func(*config.Monkey) (chaosmonkey.Outage, error)
 
+	// GetPrecheck returns an interface for the additive pre-flight termination
+	// gate (used by the Argo CD integration). Set in the init() of the argocd
+	// package; when unset (nil) the gate is treated as allow-all.
+	GetPrecheck func(*config.Monkey) (chaosmonkey.Precheck, error)
+
 	// GetConstrainer returns an interface for constraining the schedule
 	GetConstrainer func(*config.Monkey) (schedule.Constrainer, error)
 )
@@ -55,6 +60,7 @@ type Deps struct {
 	T          chaosmonkey.Terminator
 	Trackers   []chaosmonkey.Tracker
 	Ou         chaosmonkey.Outage
+	Precheck   chaosmonkey.Precheck // Argo CD integration: additive pre-flight gate (nil = allow-all)
 	ErrCounter chaosmonkey.ErrorCounter
 	Env        chaosmonkey.Env
 }

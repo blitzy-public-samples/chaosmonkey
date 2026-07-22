@@ -12,6 +12,7 @@ pages:
   - Running locally: Running-locally.md
   - Plugins:
       - Home: plugins/index.md
+      - Argo CD: plugins/ArgoCD.md
       - Decryptor: plugins/Decryptor.md
       - Error counter: plugins/Error-counter.md
       - Outage checker: plugins/Outage-checker.md
