@@ -44,11 +44,13 @@ package argocd
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Netflix/chaosmonkey/v2/config"
 	"github.com/Netflix/chaosmonkey/v2/config/param"
+	"github.com/Netflix/chaosmonkey/v2/deps"
 	"github.com/Netflix/chaosmonkey/v2/grp"
 	"github.com/Netflix/chaosmonkey/v2/mock"
 )
@@ -256,8 +258,10 @@ func TestAllow_FailClosed_EmptyResources(t *testing.T) {
 	p := newArgoPrecheck(t, srv)
 	allowed, reason, err := p.Allow(nil, standardTarget())
 	assertGracefulSkip(t, allowed, reason, err)
-	if !contains(reason, "resolve") {
-		t.Errorf("reason %q, want it to mention the unresolved governing Application", reason)
+	// A reachable, cleanly-evaluated Application that manages no matching live
+	// workload is a clean no-match, reported distinctly from a lookup error.
+	if !contains(reason, "manages the target") {
+		t.Errorf("reason %q, want it to report that no eligible Application manages the target", reason)
 	}
 }
 
@@ -333,8 +337,10 @@ func TestAllow_FailClosed_Unresolvable(t *testing.T) {
 	p := newArgoPrecheck(t, srv)
 	allowed, reason, err := p.Allow(nil, standardTarget())
 	assertGracefulSkip(t, allowed, reason, err)
-	if !contains(reason, "resolve") {
-		t.Errorf("reason %q, want it to mention the unresolved governing Application", reason)
+	// The Application evaluated cleanly but manages a different workload, so this
+	// is a clean no-match rather than a lookup error.
+	if !contains(reason, "manages the target") {
+		t.Errorf("reason %q, want it to report that no eligible Application manages the target", reason)
 	}
 }
 
@@ -386,6 +392,25 @@ func TestGetPrecheck_DisabledReturnsAllowAll(t *testing.T) {
 	}
 }
 
+// TestInit_RegistersDepsGetPrecheck proves the plugin registration side effect
+// (code review m-01/M-05): importing the argocd package runs its init(), which
+// wires deps.GetPrecheck to the package's GetPrecheck factory. The command layer
+// relies on this being non-nil at assembly time (and nil-guards it otherwise).
+// The registered factory must, for a disabled configuration, produce the inert
+// allow-all provider so existing behavior is preserved.
+func TestInit_RegistersDepsGetPrecheck(t *testing.T) {
+	if deps.GetPrecheck == nil {
+		t.Fatal("deps.GetPrecheck is nil; the argocd init() did not register the precheck factory")
+	}
+	p, err := deps.GetPrecheck(config.Defaults())
+	if err != nil {
+		t.Fatalf("registered deps.GetPrecheck(disabled) error = %v, want nil", err)
+	}
+	if _, ok := p.(allowAllPrecheck); !ok {
+		t.Errorf("registered deps.GetPrecheck(disabled) returned %T, want allowAllPrecheck", p)
+	}
+}
+
 // TestGetPrecheck_EnabledNoEndpoint_Errors verifies that genuine misconfiguration
 // surfaces at construction: an enabled integration with a credential but no
 // endpoint cannot form a valid client, so GetPrecheck returns an error (rather
@@ -426,5 +451,160 @@ func TestGetPrecheck_EnabledEndToEnd_Allows(t *testing.T) {
 	}
 	if !allowed {
 		t.Errorf("Allow allowed = false, want true (full factory->client->gate wiring); reason=%q", reason)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Global-uniqueness resolution — cross-Application ambiguity, partial-error, and
+// returned-name mismatch (code review C-03/C-04). These require a PATH-AWARE
+// server that returns a DIFFERENT Application per requested name; the shared
+// newServer answers every name identically and cannot express these scenarios.
+// -----------------------------------------------------------------------------
+
+// appResponse describes how the path-aware multi-Application server answers a
+// GET for one Application name: an HTTP status and (for 200) a JSON body.
+type appResponse struct {
+	status int
+	body   string
+}
+
+// appPathPrefix is the REST path prefix for a single-Application GET; the
+// requested Application name is the remainder of the path.
+const appPathPrefix = "/api/v1/applications/"
+
+// newMultiAppServer starts an httptest server that answers
+// GET /api/v1/applications/{name} PER NAME from routes, returning 404 for any
+// name not present. It proves GLOBAL, path-aware resolution across several
+// distinct Applications (unlike the shared newServer, which answers every name
+// with the same body and so cannot express cross-Application ambiguity or
+// partial-failure). PATCH and other methods are answered 200 (benign). The
+// caller must defer srv.Close().
+func newMultiAppServer(t *testing.T, routes map[string]appResponse) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		name := strings.TrimPrefix(r.URL.Path, appPathPrefix)
+		resp, ok := routes[name]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if resp.status != http.StatusOK {
+			w.WriteHeader(resp.status)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(resp.body))
+	}))
+}
+
+// oneWorkloadApp renders an Application named appName with the given aggregate
+// sync/health that manages exactly one live "apps/Deployment" workload named
+// workloadName. It is the readable building block for the multi-Application
+// fixtures below.
+func oneWorkloadApp(appName, sync, health, workloadName string) string {
+	return `{"metadata":{"name":"` + appName + `","namespace":"argocd"},` +
+		`"status":{"sync":{"status":"` + sync + `"},` +
+		`"health":{"status":"` + health + `"},` +
+		`"resources":[{"group":"apps","version":"v1","kind":"Deployment",` +
+		`"namespace":"prod","name":"` + workloadName + `","status":"Synced",` +
+		`"health":{"status":"Healthy"}}]}}`
+}
+
+// newArgoPrecheckMulti builds an *argoPrecheck whose eligibility allow-list is
+// apps, wired to the path-aware srv, for the cross-Application resolution tests.
+func newArgoPrecheckMulti(t *testing.T, srv *httptest.Server, apps []string) *argoPrecheck {
+	t.Helper()
+	return &argoPrecheck{
+		client:  mustClient(t, srv.URL, nil),
+		mapper:  NewMapper(apps),
+		timeout: 2 * time.Second,
+	}
+}
+
+// TestAllow_CrossAppAmbiguity_Denies proves the C-03 fix: when TWO eligible
+// Applications each manage a live workload matching the target, ownership is
+// ambiguous and the gate must fail closed rather than silently pick the first.
+func TestAllow_CrossAppAmbiguity_Denies(t *testing.T) {
+	routes := map[string]appResponse{
+		"appA": {http.StatusOK, oneWorkloadApp("appA", SyncStatusSynced, HealthStatusHealthy, "shared")},
+		"appB": {http.StatusOK, oneWorkloadApp("appB", SyncStatusSynced, HealthStatusHealthy, "shared")},
+	}
+	srv := newMultiAppServer(t, routes)
+	defer srv.Close()
+
+	p := newArgoPrecheckMulti(t, srv, []string{"appA", "appB"})
+	allowed, reason, err := p.Allow(nil, mock.Instance{App: "shared", Cluster: "shared"})
+	assertGracefulSkip(t, allowed, reason, err)
+	if !contains(reason, "ambiguous") {
+		t.Errorf("reason %q, want it to report ambiguous ownership", reason)
+	}
+}
+
+// TestAllow_PartialLookupError_Denies proves the C-03 fail-closed rule for
+// unprovable uniqueness: appA cleanly manages the target, but appB cannot be
+// evaluated (500). Because an unevaluated eligible Application might also manage
+// the target, a unique owner cannot be proven and the gate must deny even though
+// appA alone would allow.
+func TestAllow_PartialLookupError_Denies(t *testing.T) {
+	routes := map[string]appResponse{
+		"appA": {http.StatusOK, oneWorkloadApp("appA", SyncStatusSynced, HealthStatusHealthy, "web")},
+		"appB": {http.StatusInternalServerError, ""},
+	}
+	srv := newMultiAppServer(t, routes)
+	defer srv.Close()
+
+	p := newArgoPrecheckMulti(t, srv, []string{"appA", "appB"})
+	allowed, reason, err := p.Allow(nil, mock.Instance{App: "web", Cluster: "web"})
+	assertGracefulSkip(t, allowed, reason, err)
+	if !contains(reason, "unique ownership") {
+		t.Errorf("reason %q, want it to report that unique ownership could not be proven", reason)
+	}
+}
+
+// TestAllow_ReturnedNameMismatch_Denies proves the C-04 defensive check: when
+// the server answers GET /applications/appA with a body whose metadata.name is a
+// DIFFERENT Application ("someone-else"), the name-echo mismatch is treated as an
+// evaluation failure, so no governing Application resolves and the gate denies.
+// A wrong Application is never used as the governing target.
+func TestAllow_ReturnedNameMismatch_Denies(t *testing.T) {
+	routes := map[string]appResponse{
+		"appA": {http.StatusOK, oneWorkloadApp("someone-else", SyncStatusSynced, HealthStatusHealthy, "web")},
+	}
+	srv := newMultiAppServer(t, routes)
+	defer srv.Close()
+
+	p := newArgoPrecheckMulti(t, srv, []string{"appA"})
+	allowed, reason, err := p.Allow(nil, mock.Instance{App: "web", Cluster: "web"})
+	assertGracefulSkip(t, allowed, reason, err)
+	if !contains(reason, "different Application") {
+		t.Errorf("reason %q, want it to report the returned-name mismatch", reason)
+	}
+}
+
+// TestAllow_SingleOwnerAmongMany_Allows proves the happy multi-Application path:
+// three eligible Applications are reachable and healthy, but only appB manages
+// the target's workload (appA and appC manage unrelated workloads). Resolution is
+// globally unique with no evaluation errors, so the Synced+Healthy governing
+// Application is allowed.
+func TestAllow_SingleOwnerAmongMany_Allows(t *testing.T) {
+	routes := map[string]appResponse{
+		"appA": {http.StatusOK, oneWorkloadApp("appA", SyncStatusSynced, HealthStatusHealthy, "other-1")},
+		"appB": {http.StatusOK, oneWorkloadApp("appB", SyncStatusSynced, HealthStatusHealthy, "target-wl")},
+		"appC": {http.StatusOK, oneWorkloadApp("appC", SyncStatusSynced, HealthStatusHealthy, "other-2")},
+	}
+	srv := newMultiAppServer(t, routes)
+	defer srv.Close()
+
+	p := newArgoPrecheckMulti(t, srv, []string{"appA", "appB", "appC"})
+	allowed, reason, err := p.Allow(nil, mock.Instance{App: "target-wl", Cluster: "target-wl"})
+	if err != nil {
+		t.Fatalf("Allow error = %v, want nil", err)
+	}
+	if !allowed {
+		t.Errorf("Allow allowed = false, want true (unique owner among many eligible Applications); reason=%q", reason)
 	}
 }

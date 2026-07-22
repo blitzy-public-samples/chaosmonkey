@@ -119,7 +119,13 @@ denies every experiment). When a termination target correlates to one of those
 Applications through a live managed workload in its `status.resources`, the gate
 permits the experiment only while that `Application` is both `Synced` and
 `Healthy`; on any error, missing Application, ambiguity, or uncertain ownership
-it **fails closed** and skips the experiment. To additionally record chaos
-actions back to Argo CD, activate the best-effort write-back by adding
-`"argocd"` to the `trackers` list (for example, `trackers = ["argocd"]`). See
-the [Argo CD plugin documentation](plugins/ArgoCD) for full details.
+it **fails closed** and skips the experiment. Applications are addressed by exact
+name, optionally scoped by `argocd.project`; there is no `appNamespace` key and
+no label-selector discovery. To additionally record chaos actions back to Argo
+CD, activate the best-effort write-back by adding `"argocd"` to the `trackers`
+list (for example, `trackers = ["argocd"]`). The write-back sets a single,
+overwritten annotation recording the most recent termination attempt (written
+before the kill, so it records an attempt rather than a confirmed kill). See the
+[Argo CD plugin documentation](plugins/ArgoCD) for full details, including
+authentication/TLS, ApplicationSet annotation preservation, and edge-case
+behavior.

@@ -36,10 +36,15 @@ To turn on the Argo CD integration:
    `chaosmonkey.trackers` list, i.e. `trackers = ["argocd"]`.
 
 Like the other extension points, the Argo CD plugin registers itself through a Go
-`init()` function and is loaded through a blank import in
-`cmd/chaosmonkey/main.go`, matching the existing outage / tracker / constrainer
-plugin registration pattern. See the [Plugins](index.md) page for how to build a
-custom version of Chaos Monkey with plugins.
+`init()` function that wires the `deps.GetPrecheck` factory, matching the existing
+outage / tracker / constrainer registration pattern. That `init()` currently runs
+because the `tracker` package imports the `argocd` package, so building Chaos
+Monkey with the tracker factory pulls the precheck registration in transitively; a
+dedicated blank import in `cmd/chaosmonkey/main.go` is planned to make the
+registration explicit. The terminate command nil-guards the factory, so even
+without registration the gate simply degrades to allow-all rather than failing.
+See the [Plugins](index.md) page for how to build a custom version of Chaos Monkey
+with plugins.
 
 ## Configuration
 
@@ -53,12 +58,18 @@ All configuration lives under the optional `[argocd]` section of
 - `token` — inline bearer token (JWT). Prefer `token_file` in production.
 - `token_file` — path to a file containing the bearer token (preferred over the
   inline `token`).
-- `project` — optional Argo CD project used to scope `Application` lookups.
+- `project` — optional Argo CD project used to scope `Application` lookups. When
+  set, it is sent as the `project` query parameter on `GET` and inside the
+  `ApplicationPatchRequest` body on write-back, so Argo CD returns `403` if the
+  named `Application` belongs to a different project. Applications are addressed
+  by name (optionally within this project) in the Argo CD control-plane namespace;
+  there is no `appNamespace` key for the app-in-any-namespace feature.
 - `applications` — list of **exact** chaos-eligible Argo CD `Application` names,
-  each matched against an Application's `metadata.name`. Label-selector–based
-  discovery via the Argo CD list API is a concern of the Argo CD client layer,
-  not this key. An empty list makes no Application eligible, so the gate then
-  denies every experiment.
+  each matched against an Application's `metadata.name` and fetched individually
+  via `GET /api/v1/applications/{name}`. Eligibility is by exact name **only**:
+  there is no label-selector or Argo CD list-API discovery, by design (see
+  *Eligibility model and boundaries* below). An empty list makes no Application
+  eligible, so the gate then denies every experiment.
 - `insecure_skip_verify` — boolean, default `false`. Skip TLS verification to the
   Argo CD server.
 - `ca_cert` — path to a PEM CA bundle used to verify the Argo CD server
@@ -109,24 +120,104 @@ existing safety controls — `enabled` / `leashed`, the outage checker, account
 gating, `Exception` / whitelist opt-outs, and the min-time `Checker`. It can only
 make Chaos Monkey *more* conservative, never less.
 
+## Eligibility model and boundaries
+
+Eligibility is an explicit, operator-controlled **allow-list**, not automatic
+discovery. Only Argo CD `Application`s whose exact `metadata.name` appears in
+`argocd.applications` are considered, and each is fetched individually with
+`GET /api/v1/applications/{name}` (optionally scoped by `argocd.project`). There is
+deliberately **no** label-selector matching and **no** use of the Argo CD list API.
+
+This is a design boundary, not an omission. Chaos Monkey v2 natively targets
+Spinnaker-managed cloud instances (identified by application name, account, region,
+cluster, and ASG) — it does not natively target Kubernetes pods. The Argo CD
+integration is a thin, client-side **overlay** implemented with only the Go
+standard library (`net/http` / `encoding/json` / `crypto/tls`), performing
+read-only single-`Application` GETs plus a best-effort annotation PATCH. It
+intentionally embeds neither a Kubernetes client nor the Argo CD SDK, both of which
+would pull a large, modern dependency tree that conflicts with the project's pinned
+dependencies.
+
+A direct consequence concerns how a target is correlated to its governing
+`Application`. Because the integration runs no Kubernetes client, it cannot read the
+`app.kubernetes.io/instance` tracking label from the live cluster objects — that
+label lives on the running workload in the cluster, not in the `Application`
+resource returned by the REST API. Instead, ownership is derived **authoritatively
+from the `Application`'s own `status.resources[]`** — the resources Argo CD itself
+reports it manages — and is accepted only when the target correlates to **exactly
+one** live managed workload across **all** eligible `Application`s (global
+uniqueness). Argo CD hook resources and prune-only entries are excluded from this
+correlation, since they are not steady-state workloads.
+
+The practical effects:
+
+- Eligibility must be curated explicitly, keeping the chaos blast radius under
+  direct operator control.
+- If the target correlates to more than one eligible `Application` (ambiguous
+  ownership), or to none, the gate **fails closed** and skips.
+- Both the gate and the write-back use this **same** resolver, so the write-back
+  can never annotate an `Application` the gate did not evaluate.
+
 ## Write-back (event annotation)
 
-After a termination is recorded, the `argocd` tracker — an implementation of the
+The `argocd` tracker — an implementation of the
 [Tracker](https://pkg.go.dev/github.com/Netflix/chaosmonkey/v2#Tracker) interface,
 registered in
 [tracker/tracker.go](https://github.com/Netflix/chaosmonkey/blob/master/tracker/tracker.go)
-— PATCHes a custom annotation onto the governing `Application`. For example, an
-annotation `chaosmonkey.netflix.com/last-termination` carrying the instance id, an
-RFC3339 timestamp, the termination id, and the leashed flag. That annotation is
-stored on the `Application` and is visible through the Argo CD API and the
-Application's resource/manifest (annotations) view. It is **not** automatically
-added to Argo CD's deployment history or event timeline; surfacing it that way
-requires the Notifications configuration described below.
+— PATCHes a single custom annotation onto the governing `Application`:
+`chaosmonkey.netflix.com/last-termination`, whose value is a compact JSON object
+carrying the instance id, an RFC3339 timestamp, the leashed flag, and a `phase`
+field. The `chaosmonkey.Termination` type has no termination-id field, so none is
+recorded; the instance id is the subject of the record.
+
+**It records an attempt, not a confirmed kill.** Chaos Monkey's tracker loop runs
+*before* the killer executes, so the annotation is written as the termination is
+about to happen; the `phase` field is set to `pre-execution` to make this explicit.
+It is also a **single, overwritten breadcrumb**: each termination replaces the
+previous value, so the annotation always reflects only the most recent attempt —
+it is not a durable, append-only audit trail. Operators who need durable history
+should consume Chaos Monkey's own termination store, or wire Argo CD Notifications
+(below) to emit an event per termination.
+
+That annotation is stored on the `Application` and is visible through the Argo CD
+API and the Application's resource/manifest (annotations) view. It is **not**
+automatically added to Argo CD's deployment history or event timeline; surfacing
+it that way requires the Notifications configuration described below.
 
 The write-back is **best-effort and non-blocking**: on any failure it logs and
-returns `nil`, so a write-back error never blocks or fails a termination. This is
-required because the termination workflow otherwise treats a tracker error as
-fatal.
+returns `nil`, so a write-back error never blocks or fails a termination (the
+termination workflow otherwise treats a tracker error as fatal). Because the
+tracker runs on the pre-kill path, the whole write-back — target-resolution reads
+plus the annotation PATCH — is bounded by a short independent deadline (the
+smaller of `argocd.timeout` and an internal 5-second cap), so a slow or hung Argo
+CD API cannot stall a termination for the full configured timeout. The write-back
+resolves its target with the **same** strict, globally-unique resolver as the
+gate, so it can never annotate a different `Application` than the gate evaluated,
+and it rejects a PATCH whose response names a different `Application`.
+
+### ApplicationSet annotation preservation
+
+When the governing `Application` is generated by an **ApplicationSet**, the
+ApplicationSet controller reconciles the `Application` and, by default, removes
+annotations it does not manage — which would strip the
+`chaosmonkey.netflix.com/last-termination` breadcrumb on the next reconcile. To
+keep it, add the annotation key to the owning ApplicationSet's
+`spec.preservedFields.annotations` (or configure a supported global
+preserved-fields policy on the ApplicationSet controller):
+
+```yaml
+# ApplicationSet.spec
+preservedFields:
+  annotations:
+    - chaosmonkey.netflix.com/last-termination
+```
+
+This is operator-side configuration on the ApplicationSet; Chaos Monkey cannot set
+it on the managed `Application`. The annotation-preservation behavior described
+here was verified against Argo CD v2.x/v3.x (`argoproj.io/v1alpha1`); confirm the
+field against your installed Argo CD version.
+
+### Notifications (optional)
 
 Optionally, when the `argocd-notifications-controller` is installed, chaos events
 can be surfaced through Argo CD Notifications. This takes more than a subscription:
@@ -208,10 +299,11 @@ never use it in production.
   only Applications whose exact `metadata.name` is listed in `argocd.applications`
   are considered, and the selected target must correlate to exactly one live
   managed workload in that Application's `status.resources[]`. Chaos Monkey does
-  not infer eligibility from the `app.kubernetes.io/instance` tracking label;
-  label-selector–based Application listing via the Argo CD list API is a concern of
-  the Argo CD client layer. If no eligible `Application` manages the target, or
-  ownership is ambiguous, the gate fails closed (skips).
+  not infer eligibility from the `app.kubernetes.io/instance` tracking label, and
+  label-selector–based Application listing via the Argo CD list API is **not
+  implemented, by design** (see *Eligibility model and boundaries* above for why).
+  If no eligible `Application` manages the target, or ownership is ambiguous, the
+  gate fails closed (skips).
 
 See the [Plugins](index.md) page for info on how to build a custom version of Chaos
 Monkey with your plugin. For the full configuration reference, see the

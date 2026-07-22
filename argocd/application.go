@@ -54,14 +54,21 @@ type HealthStatus struct {
 // ResourceStatus describes a single resource managed by the Application, as
 // reported in status.resources[]. Health is a pointer because Argo CD may omit
 // it for resources that do not report health.
+//
+// Hook and RequiresPruning mirror the official argoproj.io ResourceStatus
+// fields. A resource that is a sync Hook (e.g. a one-shot Job) or that is only
+// pending pruning is NOT a stable, chaos-eligible managed workload, so both are
+// modeled and excluded from target ownership (added per code review C-02).
 type ResourceStatus struct {
-	Group     string        `json:"group"`
-	Version   string        `json:"version"`
-	Kind      string        `json:"kind"`
-	Namespace string        `json:"namespace"`
-	Name      string        `json:"name"`
-	Status    string        `json:"status"`
-	Health    *HealthStatus `json:"health,omitempty"`
+	Group           string        `json:"group"`
+	Version         string        `json:"version"`
+	Kind            string        `json:"kind"`
+	Namespace       string        `json:"namespace"`
+	Name            string        `json:"name"`
+	Status          string        `json:"status"`
+	Health          *HealthStatus `json:"health,omitempty"`
+	Hook            bool          `json:"hook,omitempty"`
+	RequiresPruning bool          `json:"requiresPruning,omitempty"`
 }
 
 // Sync status values reported by Argo CD (status.sync.status).
@@ -123,29 +130,40 @@ func (r ResourceStatus) IsWorkload() bool {
 }
 
 // IsLive reports whether Argo CD indicates the resource currently exists as a
-// live object. Liveness requires a reported health that is neither Missing nor
-// Unknown (nor empty/absent). Because ResourceStatus.Status is a
-// *synchronization* state (Synced/OutOfSync) rather than proof of a live
-// object, and health may be omitted entirely, an absent health is treated as
-// "not proven live" so the gate fails closed.
-// (Added for the Argo CD integration per code review M-01.)
+// live object. It uses a strict ALLOW-LIST of known-live health states
+// (Healthy / Progressing / Degraded / Suspended) so that an absent health, a
+// Missing/Unknown health, or any unrecognized/future health string all fail
+// closed as "not proven live". Because ResourceStatus.Status is a
+// *synchronization* state (Synced/OutOfSync) rather than proof of a live object,
+// only the health field is consulted here.
+// (Changed from a reject-list to a fail-closed allow-list per code review C-02;
+// originally added per code review M-01.)
 func (r ResourceStatus) IsLive() bool {
 	if r.Health == nil {
 		return false
 	}
 	switch r.Health.Status {
-	case HealthStatusMissing, HealthStatusUnknown, "":
-		return false
-	default:
+	case HealthStatusHealthy, HealthStatusProgressing, HealthStatusDegraded, HealthStatusSuspended:
 		return true
+	default:
+		// Missing, Unknown, empty, or any unrecognized future value: fail closed.
+		return false
 	}
 }
 
-// IsLiveWorkload reports whether the resource is both a supported workload kind
-// (IsWorkload) and currently live (IsLive). This is the precise per-resource
-// safety predicate the target gate relies on.
-// (Added for the Argo CD integration per code review M-01.)
+// IsLiveWorkload reports whether the resource is a stable, chaos-eligible
+// managed workload: a supported workload kind (IsWorkload) that is currently
+// live (IsLive) and is neither a sync Hook nor a resource pending pruning. Hook
+// resources (e.g. one-shot Jobs) and prune-pending resources are transient
+// GitOps artifacts rather than steady-state workloads, so they are excluded from
+// target ownership. This is the precise per-resource safety predicate the target
+// gate relies on.
+// (Hook/RequiresPruning exclusion added per code review C-02; originally added
+// per code review M-01.)
 func (r ResourceStatus) IsLiveWorkload() bool {
+	if r.Hook || r.RequiresPruning {
+		return false
+	}
 	return r.IsWorkload() && r.IsLive()
 }
 

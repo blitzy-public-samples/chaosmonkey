@@ -46,8 +46,9 @@ func getTrackers(cfg *config.Monkey) ([]chaosmonkey.Tracker, error) {
 	return result, nil
 }
 
-// getTracker returns a tracker by name
-// No trackers have been implemented yet
+// getTracker returns a tracker by name. The Argo CD write-back tracker
+// ("argocd") is implemented; additional trackers are added as new cases as they
+// are contributed to the open source project.
 func getTracker(kind string, cfg *config.Monkey) (chaosmonkey.Tracker, error) {
 	switch kind {
 	// As trackers are contributed to the open source project, they should

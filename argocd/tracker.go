@@ -25,9 +25,20 @@ import (
 )
 
 // annotationKey is the Application annotation Chaos Monkey writes to record the
-// most recent termination it performed against the Application's workloads. It
-// is visible through the Argo CD API and the Application's metadata/manifest
-// view in the UI, surfacing the chaos action in the shared GitOps timeline.
+// MOST RECENT termination attempt it made against the Application's workloads. It
+// is visible through the Argo CD API and the Application's metadata view in the
+// UI, surfacing the latest chaos action alongside the Application in Argo CD. It
+// is a single, overwritten "last-termination" breadcrumb — NOT a durable,
+// append-only event timeline (see the terminationAnnotation durability note).
+//
+// ApplicationSet durability (code review M-07): when an Application is generated
+// by an ApplicationSet, the ApplicationSet controller reconciles the Application
+// and, by default, can strip annotations it does not own. Operators who want this
+// breadcrumb to survive reconciliation must add it to the owning ApplicationSet's
+// spec.preservedFields.annotations (or a supported global preserved-fields
+// policy). This is an operator-side configuration on the ApplicationSet, not
+// something this client can set on the managed Application; it is documented in
+// docs/plugins/ArgoCD.md.
 //
 // Optional Argo CD Notifications: operators who run the (optional) Argo CD
 // Notifications controller can additionally subscribe to events via annotations
@@ -37,7 +48,27 @@ import (
 // create or manage any notifications.argoproj.io subscription annotations.
 const annotationKey = "chaosmonkey.netflix.com/last-termination"
 
+// annotationPhasePreExecution marks the payload as recording a termination
+// ATTEMPT written on the pre-kill path (see the terminationAnnotation
+// truthfulness note). (Added for the Argo CD integration per code review M-02.)
+const annotationPhasePreExecution = "pre-execution"
+
 // terminationAnnotation is the compact JSON payload stored in annotationKey.
+//
+// Truthfulness (code review M-02): the tracker loop runs BEFORE the killer
+// executes — term.doTerminate iterates every tracker and only afterwards calls
+// killer.Execute — so this annotation records a termination ATTEMPT that is
+// about to be carried out, not a confirmed kill. The Phase field states this
+// explicitly ("pre-execution") so a reader of the Argo CD timeline is not misled
+// into believing the workload was definitely terminated at the moment of write.
+//
+// Durability (code review M-02): the annotation holds only the MOST RECENT
+// attempt for the Application — a later termination overwrites it. It is a
+// lightweight "last-termination" breadcrumb surfaced in the Argo CD UI, not a
+// durable, append-only audit trail. Operators needing durable history should
+// consume the existing termination store or wire the optional Argo CD
+// Notifications controller (AAP 0.2.2).
+//
 // The chaosmonkey.Termination type carries no termination identifier (only
 // Instance, Time, and Leashed), so the instance id doubles as the human-readable
 // subject of the record; no termination-id field is fabricated.
@@ -45,6 +76,7 @@ type terminationAnnotation struct {
 	Instance string `json:"instance"`
 	Time     string `json:"time"`
 	Leashed  bool   `json:"leashed"`
+	Phase    string `json:"phase"`
 }
 
 // argoTracker is a best-effort chaosmonkey.Tracker that records terminations as
@@ -55,6 +87,27 @@ type argoTracker struct {
 	client  *Client
 	mapper  *Mapper
 	timeout time.Duration
+}
+
+// maxWriteBackTimeout caps how long a single best-effort annotation write-back
+// may run. The tracker loop executes on the pre-kill path (before
+// killer.Execute), so this bounds the extra latency a write-back can add to a
+// termination independently of the (typically larger) configured argocd.timeout
+// that also governs the sync/health gate. (Added for the Argo CD integration per
+// code review M-01.)
+const maxWriteBackTimeout = 5 * time.Second
+
+// writeBackBudget returns the deadline for one best-effort write-back: the
+// smaller of the configured Argo CD timeout and maxWriteBackTimeout. A
+// non-positive configured value (which the config layer defaults away) falls
+// back to the cap. This keeps the annotation PATCH — target-resolution GETs plus
+// the PATCH — from stalling the terminate run for the full configured timeout.
+// (Added for the Argo CD integration per code review M-01.)
+func writeBackBudget(configured time.Duration) time.Duration {
+	if configured <= 0 || configured > maxWriteBackTimeout {
+		return maxWriteBackTimeout
+	}
+	return configured
 }
 
 // NewTracker builds the Argo CD write-back tracker. It is intentionally lenient:
@@ -121,62 +174,49 @@ func (t argoTracker) Track(trm chaosmonkey.Termination) error {
 		return nil
 	}
 
-	// Bound the entire write-back (target-resolution GETs plus the annotation
-	// PATCH) by the configured timeout so a slow or hung Argo CD API can never
-	// stall the terminate run.
-	ctx, cancel := context.WithTimeout(context.Background(), t.timeout)
+	// Bound the whole write-back (target-resolution GETs plus the annotation
+	// PATCH) by the write-back budget — the smaller of argocd.timeout and
+	// maxWriteBackTimeout — so a slow or hung Argo CD API on the pre-kill path
+	// can never stall the terminate run for the full configured timeout (M-01).
+	ctx, cancel := context.WithTimeout(context.Background(), writeBackBudget(t.timeout))
 	defer cancel()
 
-	// Resolve the Argo CD Application that authoritatively manages the
-	// terminated instance. The delivered Mapper is client-free by design and
-	// deliberately never infers ownership from name coincidence, so resolution
-	// correlates the instance against each eligible Application's authoritative
-	// status.resources[] inventory (see resolveApplication).
-	name, ok := t.resolveApplication(ctx, trm.Instance)
-	if !ok {
-		log.Printf("argocd tracker: could not resolve Application for instance %s; skipping write-back", trm.Instance.ID())
+	// C-04: resolve the governing Application with the SAME shared, fail-closed
+	// resolver the sync/health gate uses (Mapper.resolveGoverningApplication), so
+	// the annotation can never land on a different Application than the gate
+	// evaluated. The tracker has no InstanceGroup in scope, so it resolves by
+	// instance only (nil group); a narrower identifier set can only ever resolve
+	// to the same Application the gate matched or to none — a broader match would
+	// have made the gate's resolution ambiguous and therefore denied the
+	// termination. Any ambiguity, unprovable uniqueness, lookup error, or no
+	// match is returned as an error, which the best-effort tracker logs and
+	// swallows (skip write-back), never surfacing it as a termination failure.
+	resolved, err := t.mapper.resolveGoverningApplication(ctx, t.client, nil, trm.Instance)
+	if err != nil {
+		log.Printf("argocd tracker: %v; skipping write-back for instance %s", err, trm.Instance.ID())
 		return nil
 	}
+	name := resolved.Name()
 
 	payload, err := json.Marshal(terminationAnnotation{
 		Instance: trm.Instance.ID(),
 		Time:     trm.Time.Format(time.RFC3339),
 		Leashed:  trm.Leashed,
+		Phase:    annotationPhasePreExecution,
 	})
 	if err != nil {
 		log.Printf("argocd tracker: could not marshal annotation for %s: %v", name, err)
 		return nil
 	}
 
+	// The PATCH re-confirms the target: PatchApplicationAnnotation rejects a
+	// response whose metadata.name differs from the resolved name (a rename or
+	// misroute between the resolving GET and the PATCH), and Argo CD enforces the
+	// configured project server-side (403). Any such mismatch surfaces here as an
+	// error and is swallowed as a skipped write-back (C-04 defense-in-depth).
 	if err := t.client.PatchApplicationAnnotation(ctx, name, annotationKey, string(payload)); err != nil {
 		log.Printf("argocd tracker: best-effort annotation write to %s failed: %v", name, err)
 		return nil
 	}
 	return nil
-}
-
-// resolveApplication finds the eligible Argo CD Application that authoritatively
-// manages the terminated instance. Because the Mapper does not itself perform
-// Argo CD lookups, the tracker queries each configured eligible Application by
-// name and returns the first whose reported status.resources[] inventory maps to
-// the instance (Mapper.ManagedResourceFor). The tracker has no InstanceGroup in
-// scope, so nil is passed (instance-only resolution); ManagedResourceFor and its
-// identifier helper both accept a nil group.
-//
-// It returns ok=false when no governing Application can be resolved — none
-// eligible, every lookup failed, or none manages the instance — in which case
-// the caller skips the write-back. Per-Application lookup errors are logged and
-// skipped rather than aborting resolution, preserving the best-effort contract.
-func (t argoTracker) resolveApplication(ctx context.Context, instance chaosmonkey.Instance) (string, bool) {
-	for _, name := range t.mapper.EligibleApplications() {
-		app, err := t.client.GetApplication(ctx, name)
-		if err != nil {
-			log.Printf("argocd tracker: could not fetch Application %q while resolving write-back target: %v", name, err)
-			continue
-		}
-		if _, ok := t.mapper.ManagedResourceFor(app, nil, instance); ok {
-			return app.Metadata.Name, true
-		}
-	}
-	return "", false
 }

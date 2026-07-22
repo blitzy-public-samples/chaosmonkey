@@ -142,6 +142,47 @@ func TestConfigFromMonkey_TokenFileReadErrorWhenEnabled(t *testing.T) {
 	}
 }
 
+// TestConfigFromMonkey_NilConfigFailsClosed verifies that a nil *config.Monkey
+// fails closed with a descriptive error rather than panicking, so a mis-wired
+// caller disables the feature instead of crashing the scheduler. (Nil guard
+// added per code review M-04.)
+func TestConfigFromMonkey_NilConfigFailsClosed(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("configFromMonkey(nil) panicked: %v, want a returned error", r)
+		}
+	}()
+	c, err := configFromMonkey(nil)
+	if err == nil {
+		t.Error("configFromMonkey(nil) error = nil, want a non-nil error")
+	}
+	if c.Enabled {
+		t.Error("configFromMonkey(nil) returned an Enabled config, want the inert zero value")
+	}
+}
+
+// TestConfigFromMonkey_OversizedTokenFileRejected verifies the M-04 fail-closed
+// bound: a token_file larger than maxTokenFileBytes is rejected with an error
+// rather than being fully buffered, so an oversized or adversarial file cannot
+// exhaust memory.
+func TestConfigFromMonkey_OversizedTokenFileRejected(t *testing.T) {
+	// One byte past the cap is enough to trip the fail-closed guard.
+	oversized := strings.Repeat("a", maxTokenFileBytes+1)
+
+	m := config.Defaults()
+	m.Set(param.ArgoCDEnabled, true)
+	m.Set(param.ArgoCDEndpoint, "https://argocd.example.com")
+	m.Set(param.ArgoCDTokenFile, writeTokenFile(t, oversized))
+
+	_, err := configFromMonkey(m)
+	if err == nil {
+		t.Fatal("configFromMonkey with an oversized token_file error = nil, want an over-limit error")
+	}
+	if !strings.Contains(err.Error(), "limit") {
+		t.Errorf("error = %q, want it to mention the size limit", err.Error())
+	}
+}
+
 // TestConfigFromMonkey_ApplicationsNormalized verifies eligible Application
 // names are trimmed, de-duplicated, and emptied entries dropped (M-02).
 func TestConfigFromMonkey_ApplicationsNormalized(t *testing.T) {

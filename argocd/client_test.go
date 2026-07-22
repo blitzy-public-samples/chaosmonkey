@@ -24,9 +24,15 @@ package argocd
 //   - NewClient: rejection of an empty endpoint, plus the configurable TLS
 //     wiring (InsecureSkipVerify accepts httptest's self-signed certificate
 //     while the default strict client rejects it);
-//   - PatchApplicationAnnotation: the PATCH method, the JSON merge-patch content
-//     type, the bearer header, the {metadata:{annotations}} body shape, and the
-//     non-2xx error path (which the tracker swallows in production).
+//   - PatchApplicationAnnotation: the PATCH method, the application/json content
+//     type, the bearer header, and the ApplicationPatchRequest envelope shape
+//     (name + patch-as-JSON-string + patchType "merge" + optional project) whose
+//     inner merge patch sets exactly the requested annotation, plus the non-2xx
+//     error path (which the tracker swallows in production);
+//   - endpoint hardening and resource bounds: rejection of a plaintext-http
+//     remote endpoint and of an endpoint that embeds credentials, refusal to
+//     follow redirects, a custom CA trust bundle, and the fail-closed
+//     oversized-response guard.
 //
 // The tests use only the standard-library testing package with a table-driven
 // style, matching the rest of the repository's test suite (testify is not used
@@ -35,8 +41,12 @@ package argocd
 import (
 	"context"
 	"encoding/json"
+	"encoding/pem"
+	"fmt"
+	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -87,6 +97,20 @@ func contains(s, sub string) bool {
 	return false
 }
 
+// assertBearerToken verifies that the request carries exactly "Bearer <want>"
+// in its Authorization header. On mismatch it reports a CREDENTIAL-SAFE message
+// that never prints the header value or the expected token, only their byte
+// lengths, so a failing assertion cannot disclose a secret to test logs.
+// (Credential-safe assertions added per code review m-02.)
+func assertBearerToken(t *testing.T, r *http.Request, want string) {
+	t.Helper()
+	got := r.Header.Get("Authorization")
+	if got != "Bearer "+want {
+		t.Errorf("Authorization header did not match the configured bearer token (got %d-byte value, want a %d-byte value)",
+			len(got), len("Bearer "+want))
+	}
+}
+
 // TestGetApplicationSuccess verifies the happy path: a GET to the correct
 // Application path carrying the bearer token, a 200 response, and a body that
 // decodes into a Synced/Healthy Application with its managed resources intact.
@@ -100,9 +124,7 @@ func TestGetApplicationSuccess(t *testing.T) {
 		if got, want := r.URL.Path, "/api/v1/applications/my-app"; got != want {
 			t.Errorf("request path = %q, want %q", got, want)
 		}
-		if got, want := r.Header.Get("Authorization"), "Bearer "+wantToken; got != want {
-			t.Errorf("Authorization header = %q, want %q", got, want)
-		}
+		assertBearerToken(t, r, wantToken)
 		w.WriteHeader(http.StatusOK)
 		writeBody(w, testApplicationJSON())
 	}))
@@ -139,9 +161,7 @@ func TestGetApplicationSendsBearerHeader(t *testing.T) {
 	const wantToken = "super-secret-jwt"
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got, want := r.Header.Get("Authorization"), "Bearer "+wantToken; got != want {
-			t.Errorf("Authorization header = %q, want %q", got, want)
-		}
+		assertBearerToken(t, r, wantToken)
 		w.WriteHeader(http.StatusOK)
 		writeBody(w, testApplicationJSON())
 	}))
@@ -189,6 +209,7 @@ func TestGetApplicationErrors(t *testing.T) {
 	}{
 		{name: "not found", status: http.StatusNotFound, wantErrContains: "not found"},
 		{name: "forbidden", status: http.StatusForbidden, wantErrContains: "forbidden"},
+		{name: "unauthorized", status: http.StatusUnauthorized, wantErrContains: "status"},
 		{name: "server error", status: http.StatusInternalServerError, wantErrContains: "status"},
 	}
 
@@ -260,41 +281,75 @@ func TestNewClientNoEndpoint(t *testing.T) {
 }
 
 // TestPatchApplicationAnnotationSuccess verifies the best-effort write-back
-// request shape: a PATCH carrying the JSON merge-patch content type and the
-// bearer header, with a body that sets exactly the requested metadata
-// annotation.
+// request shape after the C-01/M-03 envelope fix: a PATCH to the plain
+// application path (no ?project= query) carrying the application/json content
+// type and the bearer header, whose body is the Argo CD ApplicationPatchRequest
+// envelope. The envelope's name must be the target Application, patchType must
+// be "merge", the configured project must travel INSIDE the body, and the inner
+// "patch" field must be a JSON *string* that, once decoded, sets exactly the
+// requested metadata annotation.
 func TestPatchApplicationAnnotationSuccess(t *testing.T) {
-	const wantToken = "test-token"
+	const (
+		wantToken   = "test-token"
+		wantProject = "team-a"
+	)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPatch {
 			t.Errorf("request method = %q, want %q", r.Method, http.MethodPatch)
 		}
-		if got, want := r.Header.Get("Content-Type"), "application/merge-patch+json"; got != want {
+		if got, want := r.URL.Path, "/api/v1/applications/my-app"; got != want {
+			t.Errorf("patch path = %q, want %q", got, want)
+		}
+		// The project scope must NOT be a query parameter on a PATCH; it travels
+		// inside the envelope body (code review C-01/M-03).
+		if got := r.URL.Query().Get("project"); got != "" {
+			t.Errorf("patch carried ?project=%q query, want none (project belongs in the body)", got)
+		}
+		if got, want := r.Header.Get("Content-Type"), "application/json"; got != want {
 			t.Errorf("Content-Type header = %q, want %q", got, want)
 		}
-		if got, want := r.Header.Get("Authorization"), "Bearer "+wantToken; got != want {
-			t.Errorf("Authorization header = %q, want %q", got, want)
+		assertBearerToken(t, r, wantToken)
+
+		// Decode the ApplicationPatchRequest envelope. The inner merge patch is a
+		// JSON *string* in the "patch" field, matching the official contract.
+		var env struct {
+			Name      string `json:"name"`
+			Patch     string `json:"patch"`
+			PatchType string `json:"patchType"`
+			Project   string `json:"project"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&env); err != nil {
+			t.Errorf("decoding patch envelope: %v", err)
+		}
+		if got, want := env.Name, "my-app"; got != want {
+			t.Errorf("envelope name = %q, want %q", got, want)
+		}
+		if got, want := env.PatchType, "merge"; got != want {
+			t.Errorf("envelope patchType = %q, want %q", got, want)
+		}
+		if got, want := env.Project, wantProject; got != want {
+			t.Errorf("envelope project = %q, want %q", got, want)
 		}
 
-		// Decode the merge patch into a local mirror of the {metadata:{annotations}}
-		// body shape and confirm the single requested annotation is present.
-		var body struct {
+		// The "patch" field is a JSON string; decode it into a mirror of the
+		// {metadata:{annotations}} merge patch and confirm the annotation.
+		var inner struct {
 			Metadata struct {
 				Annotations map[string]string `json:"annotations"`
 			} `json:"metadata"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Errorf("decoding patch body: %v", err)
+		if err := json.Unmarshal([]byte(env.Patch), &inner); err != nil {
+			t.Errorf("decoding inner merge patch %q: %v", env.Patch, err)
 		}
-		if got, want := body.Metadata.Annotations["k"], "v"; got != want {
+		if got, want := inner.Metadata.Annotations["k"], "v"; got != want {
 			t.Errorf("annotation[\"k\"] = %q, want %q", got, want)
 		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
 
-	cl, err := NewClient(Config{Endpoint: srv.URL, token: wantToken, Timeout: 5 * time.Second})
+	cl, err := NewClient(Config{Endpoint: srv.URL, token: wantToken, Project: wantProject, Timeout: 5 * time.Second})
 	if err != nil {
 		t.Fatalf("NewClient() error = %v", err)
 	}
@@ -319,5 +374,190 @@ func TestPatchApplicationAnnotationNon2xx(t *testing.T) {
 	}
 	if err := cl.PatchApplicationAnnotation(newTestContext(t), "my-app", "k", "v"); err == nil {
 		t.Error("PatchApplicationAnnotation() error = nil, want error on HTTP 500")
+	}
+}
+
+// TestNewClientRejectsInsecureOrMalformedEndpoints proves the C-06 endpoint
+// hardening: NewClient must reject any endpoint that would transmit the bearer
+// token in cleartext to a remote host, embed credentials in the URL, or use a
+// non-http(s) scheme, while still accepting plain http for loopback hosts (used
+// by the in-process httptest servers throughout this suite).
+func TestNewClientRejectsInsecureOrMalformedEndpoints(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+		wantErr  bool
+	}{
+		{name: "plain http remote host", endpoint: "http://argocd.example.com", wantErr: true},
+		{name: "endpoint embeds userinfo", endpoint: "http://user:pass@127.0.0.1:8080", wantErr: true},
+		{name: "non-http scheme", endpoint: "ftp://127.0.0.1", wantErr: true},
+		{name: "missing host", endpoint: "http://", wantErr: true},
+		{name: "https remote is allowed", endpoint: "https://argocd.example.com", wantErr: false},
+		{name: "plain http loopback is allowed", endpoint: "http://127.0.0.1:8080", wantErr: false},
+		{name: "plain http localhost is allowed", endpoint: "http://localhost:8080", wantErr: false},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := NewClient(Config{Endpoint: tc.endpoint, token: "t", Timeout: 5 * time.Second})
+			if tc.wantErr && err == nil {
+				t.Errorf("NewClient(%q) error = nil, want an endpoint-validation error", tc.endpoint)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("NewClient(%q) error = %v, want nil", tc.endpoint, err)
+			}
+		})
+	}
+}
+
+// TestClientRefusesRedirect proves the C-06 redirect guard: a server that
+// answers with a 3xx redirect must NOT be followed, because following it could
+// forward the Authorization header to another location. The client surfaces a
+// request error instead of chasing the redirect.
+func TestClientRefusesRedirect(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/somewhere-else", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	cl, err := NewClient(Config{Endpoint: srv.URL, token: "secret", Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	if _, err := cl.GetApplication(newTestContext(t), "my-app"); err == nil {
+		t.Error("GetApplication() following a redirect error = nil, want a refusing-redirect error")
+	}
+}
+
+// TestGetApplicationRejectsOversizedBody proves the M-04 fail-closed bound: a
+// response body larger than maxApplicationResponseBytes must be rejected with an
+// error rather than fully buffered, so a runaway or adversarial response cannot
+// exhaust memory. The size guard runs before JSON decoding, so the oversized
+// payload need not be valid JSON.
+func TestGetApplicationRejectsOversizedBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		// One byte past the cap is enough to trip the fail-closed guard.
+		_, _ = w.Write(make([]byte, maxApplicationResponseBytes+1))
+	}))
+	defer srv.Close()
+
+	cl, err := NewClient(Config{Endpoint: srv.URL, token: "t", Timeout: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	app, err := cl.GetApplication(newTestContext(t), "huge")
+	if err == nil {
+		t.Fatal("GetApplication() error = nil, want an over-limit error")
+	}
+	if app != nil {
+		t.Errorf("GetApplication() app = %v, want nil on over-limit body", app)
+	}
+	if !contains(err.Error(), "limit") {
+		t.Errorf("error = %q, want it to mention the size limit", err.Error())
+	}
+}
+
+// TestGetApplicationRejectsMalformedBody proves that a 200 response whose body
+// is not valid Application JSON is surfaced as a decode error (and a nil
+// Application) rather than silently yielding a zero-valued Application that the
+// sync/health gate might misread. This fails closed on a corrupt or unexpected
+// payload.
+func TestGetApplicationRejectsMalformedBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		writeBody(w, "this is definitely not json {[")
+	}))
+	defer srv.Close()
+
+	cl, err := NewClient(Config{Endpoint: srv.URL, token: "t", Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	app, err := cl.GetApplication(newTestContext(t), "my-app")
+	if err == nil {
+		t.Fatal("GetApplication() error = nil, want a decode error for a malformed body")
+	}
+	if app != nil {
+		t.Errorf("GetApplication() app = %v, want nil on decode error", app)
+	}
+}
+
+// TestGetApplicationRespectsTimeout proves the client's configured timeout is
+// wired through: against a server that never responds (it blocks until the
+// request is cancelled), a short client Timeout must abort the request with an
+// error rather than hanging. The handler unblocks on request-context
+// cancellation so the test server closes promptly.
+func TestGetApplicationRespectsTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done() // block until the client's timeout cancels the request
+	}))
+	defer srv.Close()
+
+	cl, err := NewClient(Config{Endpoint: srv.URL, token: "t", Timeout: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	start := time.Now()
+	if _, err := cl.GetApplication(newTestContext(t), "slow"); err == nil {
+		t.Error("GetApplication() against a stalled server error = nil, want a timeout error")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("GetApplication() took %s, want it to abort near the 50ms client timeout", elapsed)
+	}
+}
+
+// TestClientStringRedactsToken proves the m-02 secret-hardening fix on the
+// Client: formatting a *Client with %v, %+v, %s, or %#v must never disclose the
+// bearer token, showing only a redaction placeholder. This closes the accidental
+// %v/%+v log-leak footgun on the client object itself (Config redaction is
+// covered separately in config_test.go).
+func TestClientStringRedactsToken(t *testing.T) {
+	const secret = "super-secret-jwt-value"
+	cl, err := NewClient(Config{Endpoint: "https://argocd.example.com", token: secret, Project: "team-a", Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+
+	for _, verb := range []string{"%v", "%+v", "%s", "%#v"} {
+		out := fmt.Sprintf(verb, cl)
+		if contains(out, secret) {
+			t.Errorf("formatting Client with %q disclosed the bearer token: %s", verb, out)
+		}
+		if !contains(out, "<redacted>") {
+			t.Errorf("formatting Client with %q should show a redaction placeholder, got: %s", verb, out)
+		}
+	}
+}
+
+// TestNewClientCustomCATrust proves the crypto/tls CA-bundle path: when
+// Config.CACert points at a PEM bundle that includes the server's certificate,
+// the strict client (no InsecureSkipVerify) trusts the server and the request
+// succeeds. This exercises the bounded readFileLimited CA read plus RootCAs
+// wiring in NewClient.
+func TestNewClientCustomCATrust(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		writeBody(w, testApplicationJSON())
+	}))
+	defer srv.Close()
+
+	// Encode the httptest server's self-signed certificate as a PEM CA bundle.
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+	if caPEM == nil {
+		t.Fatal("failed to PEM-encode the test server certificate")
+	}
+	caPath := filepath.Join(t.TempDir(), "ca.pem")
+	if err := ioutil.WriteFile(caPath, caPEM, 0600); err != nil {
+		t.Fatalf("writing temp CA bundle: %v", err)
+	}
+
+	cl, err := NewClient(Config{Endpoint: srv.URL, token: "t", CACert: caPath, Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("NewClient(custom CA) error = %v", err)
+	}
+	if _, err := cl.GetApplication(newTestContext(t), "my-app"); err != nil {
+		t.Errorf("GetApplication() with a trusted custom CA error = %v, want nil", err)
 	}
 }

@@ -303,12 +303,20 @@ func Execute() {
 		}
 
 		// Argo CD integration: resolve the additive pre-flight gate provider.
-		// Registered by the argocd package's init() (blank-imported in
-		// cmd/chaosmonkey/main.go); returns an allow-all provider when the
-		// feature is disabled, so this is safe even when [argocd] is unset.
-		precheck, err := deps.GetPrecheck(cfg)
-		if err != nil {
-			log.Fatalf("FATAL: could not create argocd precheck: %+v", err)
+		// deps.GetPrecheck is registered by the argocd package's init(), which is
+		// currently pulled in transitively through the tracker package's import of
+		// argocd (the dedicated blank import in cmd/chaosmonkey/main.go is deferred
+		// per the plan). When the feature is disabled the registered factory still
+		// returns an allow-all provider. Guard against a nil factory so a custom or
+		// test entry path that has not registered the provider leaves Precheck nil
+		// — which term.doTerminate treats as allow-all — instead of panicking here
+		// before logOnPanic is installed (code review m-01/m-04).
+		var precheck chaosmonkey.Precheck
+		if deps.GetPrecheck != nil {
+			precheck, err = deps.GetPrecheck(cfg)
+			if err != nil {
+				log.Fatalf("FATAL: could not create argocd precheck: %+v", err)
+			}
 		}
 
 		defer logOnPanic(errCounter) // Handler in case of panic

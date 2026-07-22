@@ -15,8 +15,11 @@
 package argocd
 
 import (
+	"context"
 	"reflect"
 	"strings"
+
+	"github.com/pkg/errors"
 
 	"github.com/Netflix/chaosmonkey/v2"
 	"github.com/Netflix/chaosmonkey/v2/grp"
@@ -190,4 +193,131 @@ func (m *Mapper) ManagedResourceFor(app *Application, group grp.InstanceGroup, i
 		return ResourceStatus{}, false
 	}
 	return match, true
+}
+
+// applicationGetter is the read-only subset of the Argo CD client the resolver
+// needs: a single Application lookup by name. *Client satisfies it. Declaring it
+// as an interface keeps the Mapper decoupled from the concrete REST client and
+// lets resolveGoverningApplication be unit-tested with a fake getter.
+// (Added for the Argo CD integration per code review C-03/C-04.)
+type applicationGetter interface {
+	GetApplication(ctx context.Context, name string) (*Application, error)
+}
+
+// ResolvedApplication is the immutable outcome of a successful, globally unique
+// target-to-Application resolution: the single governing Application, the exact
+// live workload resource that ties the target to it, and the confirmed
+// Application name. Fields are unexported and read via accessors so a resolved
+// identity cannot be mutated after resolution.
+// (Added for the Argo CD integration per code review C-03/C-04.)
+type ResolvedApplication struct {
+	app      *Application
+	resource ResourceStatus
+	name     string
+}
+
+// Name returns the confirmed governing Application name (the name requested from
+// and echoed back by the Argo CD API).
+func (r *ResolvedApplication) Name() string { return r.name }
+
+// Namespace returns the governing Application's own metadata.namespace (the
+// Argo CD control-plane namespace the Application object lives in).
+func (r *ResolvedApplication) Namespace() string { return r.app.Metadata.Namespace }
+
+// Application returns the governing Application.
+func (r *ResolvedApplication) Application() *Application { return r.app }
+
+// Resource returns the single live workload resource that tied the target to the
+// governing Application.
+func (r *ResolvedApplication) Resource() ResourceStatus { return r.resource }
+
+// resolveGoverningApplication resolves the selected target to the ONE Argo CD
+// Application that governs it, proving GLOBAL uniqueness across the entire
+// operator-configured eligible set. It is the shared, fail-closed resolver used
+// by both the sync/health gate (precheck.go) and the write-back tracker
+// (tracker.go), so the two can never disagree about which Application a target
+// belongs to. (Added for the Argo CD integration per code review C-03/C-04.)
+//
+// Unlike a first-match loop, it evaluates EVERY eligible Application (no early
+// break) and only returns a resolution when exactly one Application manages the
+// target AND every eligible Application was successfully evaluated. Specifically:
+//
+//   - It fetches each eligible Application. A fetch error, or a response whose
+//     metadata.name does not equal the requested name (a rename/redirect/
+//     misrouting), is recorded as an evaluation failure for that candidate and
+//     the loop continues — one bad Application never masks another.
+//   - >1 match  => ambiguous ownership: deny (error). Acting would risk
+//     terminating a workload governed by a different Application than intended.
+//   - exactly 1 match but some candidates failed to evaluate => uniqueness
+//     cannot be proven (an unevaluated Application might also manage the target):
+//     deny (error).
+//   - exactly 1 match and every candidate evaluated cleanly => the unique
+//     governing Application (allow to proceed to the sync/health check).
+//   - 0 matches with some evaluation failures => surface the first error.
+//   - 0 matches with no failures => the target is not managed by any eligible
+//     Application: deny.
+//
+// The (result, error) contract is the fail-closed hinge: any non-nil error (or a
+// nil result) MUST be treated by callers as "do not act".
+func (m *Mapper) resolveGoverningApplication(ctx context.Context, getter applicationGetter, group grp.InstanceGroup, instance chaosmonkey.Instance) (*ResolvedApplication, error) {
+	candidates := m.EligibleApplications()
+	if len(candidates) == 0 {
+		return nil, errors.New("argocd: no eligible Applications configured")
+	}
+
+	var (
+		matches  []*ResolvedApplication
+		firstErr error
+		errCount int
+	)
+	for _, name := range candidates {
+		app, err := getter.GetApplication(ctx, name)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			errCount++
+			continue
+		}
+		// Defensive: the server MUST return the Application we asked for. A
+		// name mismatch (rename, redirect, or misrouting) is treated as an
+		// evaluation failure for this candidate so a wrong Application can never
+		// be used as the governing target.
+		if app == nil || strings.TrimSpace(app.Metadata.Name) != name {
+			if firstErr == nil {
+				firstErr = errors.Errorf("argocd: lookup for %q returned a different Application", name)
+			}
+			errCount++
+			continue
+		}
+		if resource, ok := m.ManagedResourceFor(app, group, instance); ok {
+			matches = append(matches, &ResolvedApplication{app: app, resource: resource, name: name})
+		}
+	}
+
+	switch {
+	case len(matches) > 1:
+		return nil, errors.Errorf("argocd: target matched %d eligible Applications %v (ambiguous ownership); refusing to act",
+			len(matches), matchNames(matches))
+	case len(matches) == 1 && errCount > 0:
+		return nil, errors.Wrapf(firstErr,
+			"argocd: target matched Application %q but %d eligible Application(s) could not be evaluated (cannot prove unique ownership)",
+			matches[0].name, errCount)
+	case len(matches) == 1:
+		return matches[0], nil
+	case errCount > 0:
+		return nil, errors.Wrap(firstErr, "argocd: could not resolve governing Application")
+	default:
+		return nil, errors.New("argocd: no eligible Application manages the target")
+	}
+}
+
+// matchNames extracts the Application names from resolved matches for a
+// human-readable ambiguity error. Names are configuration values, not secrets.
+func matchNames(matches []*ResolvedApplication) []string {
+	names := make([]string, len(matches))
+	for i, mm := range matches {
+		names[i] = mm.name
+	}
+	return names
 }

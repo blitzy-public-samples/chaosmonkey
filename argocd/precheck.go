@@ -99,59 +99,36 @@ func GetPrecheck(cfg *config.Monkey) (chaosmonkey.Precheck, error) {
 // reason and a nil error, so the scheduler is never crashed and unstable
 // workloads are never disrupted.
 //
-// The governing Application is resolved by correlating the target against the
-// authoritative status.resources[] inventory of each operator-configured
-// eligible Application (via the mapper), rather than by name coincidence. The
-// first eligible Application that manages the target is treated as governing.
+// The governing Application is resolved by the shared, fail-closed resolver
+// (Mapper.resolveGoverningApplication), which correlates the target against the
+// authoritative status.resources[] inventory of EVERY operator-configured
+// eligible Application and proves GLOBAL uniqueness: it denies when more than
+// one eligible Application manages the target (ambiguous ownership), when a
+// unique match cannot be proven because some eligible Application could not be
+// evaluated, and when a lookup fails or no eligible Application manages the
+// target. Using the same resolver as the write-back tracker guarantees the gate
+// and the annotation can never disagree about which Application a target belongs
+// to (code review C-03/C-04).
 func (p *argoPrecheck) Allow(group grp.InstanceGroup, instance chaosmonkey.Instance) (bool, string, error) {
-	// The operator allow-list is the sole source of eligibility. An empty list
-	// authorizes nothing (fail-closed).
-	candidates := p.mapper.EligibleApplications()
-	if len(candidates) == 0 {
-		return false, "argocd: no eligible Applications configured", nil
-	}
-
 	// A single deadline bounds the whole gate evaluation so a slow or
 	// unreachable Argo CD API can never stall the scheduler indefinitely.
 	ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
 	defer cancel()
 
-	// Resolve the governing Application: fetch each eligible Application and
-	// accept the first one whose authoritative resource inventory manages the
-	// selected target. Fetch errors are remembered but non-fatal to the loop,
-	// so one unreachable/renamed Application cannot mask another that governs
-	// the target; if none resolves we fail closed below.
-	var (
-		governing *Application
-		govName   string
-		lastErr   error
-	)
-	for _, name := range candidates {
-		app, err := p.client.GetApplication(ctx, name)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if _, ok := p.mapper.ManagedResourceFor(app, group, instance); ok {
-			governing = app
-			govName = name
-			break
-		}
+	// Resolve the governing Application with proven global uniqueness. Any
+	// ambiguity, unprovable uniqueness, lookup error, or no-match is returned as
+	// a non-nil error, which we convert into a graceful deny (skip) with the
+	// resolver's descriptive reason and a nil error (fail-closed).
+	resolved, err := p.mapper.resolveGoverningApplication(ctx, p.client, group, instance)
+	if err != nil {
+		return false, err.Error(), nil
 	}
 
-	// Fail-closed branch 1: the target could not be tied to any eligible,
-	// live-workload-managing Application. Surface the last API error, if any,
-	// so an unreachable API or missing/renamed Application is visible in logs.
-	if governing == nil {
-		if lastErr != nil {
-			return false, fmt.Sprintf("argocd: could not resolve governing Application: %v", lastErr), nil
-		}
-		return false, "argocd: could not resolve governing Application", nil
-	}
+	governing := resolved.Application()
+	govName := resolved.Name()
 
-	// Fail-closed branch 2: the Application manages no live workload resources.
-	// (Defense-in-depth: a successful ManagedResourceFor already implies at
-	// least one live workload, but this guards against any future divergence.)
+	// Defense-in-depth: a successful resolution already implies at least one
+	// live workload, but re-check so any future divergence still fails closed.
 	if !governing.HasLiveResources() {
 		return false, fmt.Sprintf("argocd: application %q manages no live resources", govName), nil
 	}
@@ -161,9 +138,9 @@ func (p *argoPrecheck) Allow(group grp.InstanceGroup, instance chaosmonkey.Insta
 		return true, "", nil
 	}
 
-	// Fail-closed branch 3: the Application is not eligible for chaos right now.
-	// Name both the sync and health status so Progressing/OutOfSync/Degraded/
-	// Suspended/Missing/Unknown are all visible in the scheduler logs.
+	// Fail-closed: the Application is not eligible for chaos right now. Name both
+	// the sync and health status so Progressing/OutOfSync/Degraded/Suspended/
+	// Missing/Unknown are all visible in the scheduler logs.
 	return false, fmt.Sprintf(
 		"argocd: application %q not eligible (sync=%s, health=%s)",
 		govName, governing.Status.Sync.Status, governing.Status.Health.Status,

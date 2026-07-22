@@ -30,6 +30,8 @@ package argocd
 // anywhere in the module).
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	"github.com/Netflix/chaosmonkey/v2"
@@ -356,7 +358,13 @@ func TestIsSyncedIsHealthy_ExactEquality(t *testing.T) {
 	}
 }
 
-// TestIsLiveWorkload verifies the GVK + liveness predicate (M-01).
+// TestIsLiveWorkload verifies the GVK + liveness predicate. Liveness uses a
+// fail-closed ALLOW-LIST of known-live health states (Healthy / Progressing /
+// Degraded / Suspended); an empty or unrecognized/future health is NOT live.
+// Sync Hooks and prune-pending resources are transient GitOps artifacts and are
+// excluded from ownership even when otherwise live.
+// (GVK + liveness added per M-01; allow-list + Hook/RequiresPruning exclusion
+// added per code review C-02.)
 func TestIsLiveWorkload(t *testing.T) {
 	healthPtr := func(s string) *HealthStatus { return &HealthStatus{Status: s} }
 	cases := []struct {
@@ -369,9 +377,14 @@ func TestIsLiveWorkload(t *testing.T) {
 		{"healthy Rollout in argoproj.io", ResourceStatus{Group: "argoproj.io", Kind: "Rollout", Health: healthPtr(HealthStatusHealthy)}, true},
 		{"progressing Deployment is still live", ResourceStatus{Group: "apps", Kind: "Deployment", Health: healthPtr(HealthStatusProgressing)}, true},
 		{"degraded Deployment is still live", ResourceStatus{Group: "apps", Kind: "Deployment", Health: healthPtr(HealthStatusDegraded)}, true},
+		{"suspended Deployment is still live", ResourceStatus{Group: "apps", Kind: "Deployment", Health: healthPtr(HealthStatusSuspended)}, true},
 		{"missing Deployment is not live", ResourceStatus{Group: "apps", Kind: "Deployment", Health: healthPtr(HealthStatusMissing)}, false},
 		{"unknown Deployment is not live", ResourceStatus{Group: "apps", Kind: "Deployment", Health: healthPtr(HealthStatusUnknown)}, false},
+		{"empty health is not live", ResourceStatus{Group: "apps", Kind: "Deployment", Health: healthPtr("")}, false},
+		{"unrecognized future health is not live", ResourceStatus{Group: "apps", Kind: "Deployment", Health: healthPtr("Frobnicated")}, false},
 		{"absent health is not live", ResourceStatus{Group: "apps", Kind: "Deployment"}, false},
+		{"hook resource is excluded even if healthy", ResourceStatus{Group: "apps", Kind: "Deployment", Health: healthPtr(HealthStatusHealthy), Hook: true}, false},
+		{"prune-pending resource is excluded even if healthy", ResourceStatus{Group: "apps", Kind: "Deployment", Health: healthPtr(HealthStatusHealthy), RequiresPruning: true}, false},
 		{"Service is not a workload", ResourceStatus{Group: "", Kind: "Service", Health: healthPtr(HealthStatusHealthy)}, false},
 		{"ConfigMap is not a workload", ResourceStatus{Group: "", Kind: "ConfigMap", Health: healthPtr(HealthStatusHealthy)}, false},
 		{"Deployment in wrong group is not a workload", ResourceStatus{Group: "extensions", Kind: "Deployment", Health: healthPtr(HealthStatusHealthy)}, false},
@@ -410,4 +423,138 @@ func TestHasLiveResourcesAndLiveWorkloads(t *testing.T) {
 	if only.HasLiveResources() {
 		t.Error("HasLiveResources() = true for Service-only + Missing workload, want false")
 	}
+}
+
+// fakeGetter is an in-memory applicationGetter for unit-testing the shared
+// resolver without a live REST client. A name present in errs returns that
+// error; a name present in apps returns that Application; any other name returns
+// a not-found error. (Added for the Argo CD integration per code review C-03/C-04.)
+type fakeGetter struct {
+	apps map[string]*Application
+	errs map[string]error
+}
+
+func (f fakeGetter) GetApplication(_ context.Context, name string) (*Application, error) {
+	if err, ok := f.errs[name]; ok {
+		return nil, err
+	}
+	if app, ok := f.apps[name]; ok {
+		return app, nil
+	}
+	return nil, errors.New("not found: " + name)
+}
+
+// TestResolveGoverningApplication exercises the shared, fail-closed resolver's
+// full decision matrix in isolation (C-03/C-04): unique match, cross-Application
+// ambiguity, one match with an unevaluated candidate (unprovable uniqueness),
+// returned-name mismatch, a lookup error with no match, a clean no-match, and an
+// empty eligibility allow-list. Every non-unique outcome must yield a nil result
+// and a descriptive error so callers fail closed.
+func TestResolveGoverningApplication(t *testing.T) {
+	target := mock.Instance{App: "web", Cluster: "web"}
+	ctx := context.Background()
+
+	t.Run("unique match returns immutable identity", func(t *testing.T) {
+		appA := appWith("appA", healthy("apps", "Deployment", "web"))
+		appA.Metadata.Namespace = "argocd"
+		m := NewMapper([]string{"appA", "appB"})
+		g := fakeGetter{apps: map[string]*Application{
+			"appA": appA,
+			"appB": appWith("appB", healthy("apps", "Deployment", "other")),
+		}}
+		res, err := m.resolveGoverningApplication(ctx, g, nil, target)
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if res == nil || res.Name() != "appA" {
+			t.Fatalf("resolved = %v, want the appA identity", res)
+		}
+		if res.Namespace() != "argocd" {
+			t.Errorf("Namespace() = %q, want %q", res.Namespace(), "argocd")
+		}
+		if res.Resource().Name != "web" {
+			t.Errorf("Resource().Name = %q, want %q", res.Resource().Name, "web")
+		}
+	})
+
+	t.Run("cross-application ambiguity denies", func(t *testing.T) {
+		m := NewMapper([]string{"appA", "appB"})
+		g := fakeGetter{apps: map[string]*Application{
+			"appA": appWith("appA", healthy("apps", "Deployment", "web")),
+			"appB": appWith("appB", healthy("apps", "Deployment", "web")),
+		}}
+		res, err := m.resolveGoverningApplication(ctx, g, nil, target)
+		if res != nil || err == nil {
+			t.Fatalf("res=%v err=%v, want nil result + ambiguity error", res, err)
+		}
+		if !contains(err.Error(), "ambiguous") {
+			t.Errorf("err = %q, want it to report ambiguous ownership", err.Error())
+		}
+	})
+
+	t.Run("one match with unevaluated candidate denies", func(t *testing.T) {
+		m := NewMapper([]string{"appA", "appB"})
+		g := fakeGetter{
+			apps: map[string]*Application{"appA": appWith("appA", healthy("apps", "Deployment", "web"))},
+			errs: map[string]error{"appB": errors.New("boom")},
+		}
+		res, err := m.resolveGoverningApplication(ctx, g, nil, target)
+		if res != nil || err == nil {
+			t.Fatalf("res=%v err=%v, want nil result + unprovable-uniqueness error", res, err)
+		}
+		if !contains(err.Error(), "unique ownership") {
+			t.Errorf("err = %q, want it to report unprovable unique ownership", err.Error())
+		}
+	})
+
+	t.Run("returned-name mismatch denies", func(t *testing.T) {
+		m := NewMapper([]string{"appA"})
+		g := fakeGetter{apps: map[string]*Application{
+			"appA": appWith("someone-else", healthy("apps", "Deployment", "web")),
+		}}
+		res, err := m.resolveGoverningApplication(ctx, g, nil, target)
+		if res != nil || err == nil {
+			t.Fatalf("res=%v err=%v, want nil result + mismatch error", res, err)
+		}
+		if !contains(err.Error(), "different Application") {
+			t.Errorf("err = %q, want it to report the returned-name mismatch", err.Error())
+		}
+	})
+
+	t.Run("lookup error with no match surfaces error", func(t *testing.T) {
+		m := NewMapper([]string{"appA"})
+		g := fakeGetter{errs: map[string]error{"appA": errors.New("boom")}}
+		res, err := m.resolveGoverningApplication(ctx, g, nil, target)
+		if res != nil || err == nil {
+			t.Fatalf("res=%v err=%v, want nil result + lookup error", res, err)
+		}
+		if !contains(err.Error(), "could not resolve") {
+			t.Errorf("err = %q, want it to report an unresolved governing Application", err.Error())
+		}
+	})
+
+	t.Run("clean no-match denies", func(t *testing.T) {
+		m := NewMapper([]string{"appA"})
+		g := fakeGetter{apps: map[string]*Application{
+			"appA": appWith("appA", healthy("apps", "Deployment", "other")),
+		}}
+		res, err := m.resolveGoverningApplication(ctx, g, nil, target)
+		if res != nil || err == nil {
+			t.Fatalf("res=%v err=%v, want nil result + no-match error", res, err)
+		}
+		if !contains(err.Error(), "manages the target") {
+			t.Errorf("err = %q, want it to report that no eligible Application manages the target", err.Error())
+		}
+	})
+
+	t.Run("empty allow-list denies before any lookup", func(t *testing.T) {
+		m := NewMapper(nil)
+		res, err := m.resolveGoverningApplication(ctx, fakeGetter{}, nil, target)
+		if res != nil || err == nil {
+			t.Fatalf("res=%v err=%v, want nil result + no-eligible error", res, err)
+		}
+		if !contains(err.Error(), "no eligible Applications configured") {
+			t.Errorf("err = %q, want it to report no eligible Applications configured", err.Error())
+		}
+	})
 }

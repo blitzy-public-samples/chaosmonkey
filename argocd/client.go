@@ -21,12 +21,29 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 
 	"github.com/pkg/errors"
+)
+
+// Size caps for the Argo CD client. They bound untrusted or accidentally
+// oversized inputs so the integration fails closed instead of exhausting
+// memory. (Bounded reads added for the Argo CD integration per code review M-04.)
+const (
+	// maxCACertBytes bounds the CA bundle file read in NewClient.
+	maxCACertBytes = 1 << 20 // 1 MiB
+	// maxApplicationResponseBytes bounds a successful GET Application body before
+	// it is decoded, so a malicious or runaway response cannot exhaust memory.
+	maxApplicationResponseBytes = 8 << 20 // 8 MiB
+	// maxManagedResources caps the number of status.resources[] entries accepted
+	// from a decoded Application; a response exceeding it is rejected (fail-closed)
+	// rather than driving unbounded downstream work.
+	maxManagedResources = 10000
 )
 
 // Client is a minimal Argo CD REST API client built on the Go standard library.
@@ -39,6 +56,21 @@ type Client struct {
 	httpClient *http.Client // configured with TLS + timeout
 }
 
+// String returns a credential-redacted representation of the Client so that
+// logging it (with %v, %+v, or %s) can never disclose the bearer token. The
+// token's presence is shown only as a fixed placeholder, mirroring the
+// redaction already applied to Config. (Added for the Argo CD integration per
+// code review m-02.)
+func (cl *Client) String() string {
+	return fmt.Sprintf("argocd.Client{endpoint:%q project:%q token:%s}",
+		cl.endpoint, cl.project, redactedToken(cl.token))
+}
+
+// GoString returns a credential-redacted Go-syntax representation so that %#v
+// also never discloses the bearer token. (Added for the Argo CD integration per
+// code review m-02.)
+func (cl *Client) GoString() string { return cl.String() }
+
 // NewClient builds an Argo CD REST client from a Config. TLS is configurable:
 // a CA bundle (RootCAs) when Config.CACert is set, otherwise optional
 // InsecureSkipVerify. The endpoint's trailing slash is trimmed. Returns an
@@ -49,10 +81,20 @@ func NewClient(c Config) (*Client, error) {
 		return nil, errors.New("argocd: no endpoint configured")
 	}
 
+	// Validate the endpoint before any request is built. This closes the
+	// credential-leak vectors from code review C-06: it rejects a non-absolute
+	// or non-http(s) URL, a URL that embeds credentials (userinfo), and any
+	// non-loopback host that would carry the bearer token over cleartext http.
+	if err := validateEndpoint(c.Endpoint); err != nil {
+		return nil, err
+	}
+
 	tlsConfig := &tls.Config{}
 	switch {
 	case c.CACert != "":
-		pemData, err := ioutil.ReadFile(c.CACert)
+		// Bounded read so an oversized/adversarial CA file fails closed instead
+		// of exhausting memory (code review M-04).
+		pemData, err := readFileLimited(c.CACert, maxCACertBytes)
 		if err != nil {
 			return nil, errors.Wrapf(err, "argocd: could not read ca_cert %q", c.CACert)
 		}
@@ -69,6 +111,15 @@ func NewClient(c Config) (*Client, error) {
 	httpClient := &http.Client{
 		Transport: transport,
 		Timeout:   c.Timeout,
+		// Refuse to follow redirects. Following a redirect can forward the
+		// bearer token to a different host and, on the affected Go runtime
+		// (GO-2025-3420 / CVE-2024-45336), is subject to sensitive-header
+		// leakage across a redirect chain. Returning an error stops the chain
+		// before any header is re-sent, so the client-side protection holds
+		// regardless of the runtime patch level (code review C-06).
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return errors.Errorf("argocd: refusing to follow redirect to %s (possible credential exposure)", req.URL.Redacted())
+		},
 	}
 
 	return &Client{
@@ -82,7 +133,47 @@ func NewClient(c Config) (*Client, error) {
 	}, nil
 }
 
-// applicationURL builds the REST URL for a single Application, adding the
+// validateEndpoint parses and validates the configured Argo CD endpoint before
+// any request is built, closing the credential-leak vectors from code review
+// C-06. It requires an absolute http/https URL with a host, rejects a URL that
+// embeds credentials (userinfo), and requires HTTPS for any non-loopback host so
+// a bearer token is never transmitted in cleartext to a remote server. Plain
+// http is permitted ONLY for loopback hosts (localhost / 127.0.0.1 / ::1), which
+// supports local development and in-process test servers without weakening
+// production security.
+func validateEndpoint(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return errors.Wrapf(err, "argocd: invalid endpoint %q", raw)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return errors.Errorf("argocd: endpoint %q must use http or https", raw)
+	}
+	if u.Host == "" {
+		return errors.Errorf("argocd: endpoint %q is missing a host", raw)
+	}
+	if u.User != nil {
+		return errors.New("argocd: endpoint must not embed credentials (userinfo)")
+	}
+	if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
+		return errors.Errorf("argocd: endpoint %q must use https (plain http is allowed only for loopback hosts)", raw)
+	}
+	return nil
+}
+
+// isLoopbackHost reports whether host is a loopback name or address, for which
+// plain http is tolerated (local development / in-process test servers).
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// applicationURL builds the REST URL for a single Application GET, adding the
 // optional project query parameter when a project scope is configured.
 func (cl *Client) applicationURL(name string) string {
 	u := fmt.Sprintf("%s/api/v1/applications/%s", cl.endpoint, url.PathEscape(name))
@@ -90,6 +181,14 @@ func (cl *Client) applicationURL(name string) string {
 		u += "?project=" + url.QueryEscape(cl.project)
 	}
 	return u
+}
+
+// patchURL builds the REST URL for the ApplicationService.Patch endpoint. Unlike
+// applicationURL it does NOT append a project query parameter: for a PATCH the
+// project scope travels inside the ApplicationPatchRequest body, matching the
+// official contract (code review C-01/M-03).
+func (cl *Client) patchURL(name string) string {
+	return fmt.Sprintf("%s/api/v1/applications/%s", cl.endpoint, url.PathEscape(name))
 }
 
 // GetApplication fetches a single Argo CD Application by name. It attaches the
@@ -127,30 +226,71 @@ func (cl *Client) GetApplication(ctx context.Context, name string) (app *Applica
 		return nil, errors.Errorf("argocd: unexpected status %d fetching application %q", resp.StatusCode, name)
 	}
 
-	body, err := ioutil.ReadAll(resp.Body)
+	// Read the body under a hard size cap so a malicious or runaway response
+	// fails closed instead of exhausting memory. Reading one byte past the cap
+	// lets us distinguish a legitimate body from an over-limit one (code review
+	// M-04).
+	body, err := ioutil.ReadAll(io.LimitReader(resp.Body, maxApplicationResponseBytes+1))
 	if err != nil {
 		return nil, errors.Wrapf(err, "argocd: failed to read response body from %s", u)
+	}
+	if int64(len(body)) > maxApplicationResponseBytes {
+		return nil, errors.Errorf("argocd: application %q response exceeds %d-byte limit", name, maxApplicationResponseBytes)
 	}
 
 	var out Application
 	if err := json.Unmarshal(body, &out); err != nil {
 		return nil, errors.Wrapf(err, "argocd: failed to decode application %q", name)
 	}
+	// Reject a pathological resource inventory (fail-closed) so an absurd
+	// status.resources[] cannot drive unbounded downstream work (code review M-04).
+	if len(out.Status.Resources) > maxManagedResources {
+		return nil, errors.Errorf("argocd: application %q reports %d resources, exceeding the %d limit",
+			name, len(out.Status.Resources), maxManagedResources)
+	}
 	return &out, nil
 }
 
-// mergePatch is the body of a JSON merge patch that sets a single annotation on
-// an Application's metadata.
+// mergePatch is the INNER Kubernetes JSON merge patch that sets a single
+// annotation on an Application's metadata. It is serialized to a JSON string and
+// carried in the ApplicationPatchRequest envelope's "patch" field (it is NOT the
+// HTTP body on its own).
 type mergePatch struct {
 	Metadata struct {
 		Annotations map[string]string `json:"annotations"`
 	} `json:"metadata"`
 }
 
-// PatchApplicationAnnotation applies a JSON merge patch that sets a single
-// annotation (key=value) on the Application's metadata. It is annotation-only:
-// it does not trigger a sync, refresh, or rollback. Callers (the tracker) treat
-// any error as non-fatal and swallow it. A non-2xx response yields an error.
+// applicationPatchRequest is the Argo CD ApplicationService.Patch request
+// envelope for PATCH /api/v1/applications/{name}. It mirrors the official
+// argoproj.io ApplicationPatchRequest message: the inner Kubernetes merge patch
+// travels as a JSON *string* in Patch, PatchType selects the merge strategy
+// ("merge"), and Project (when set) scopes the write inside the body rather than
+// as a query parameter. Sending this envelope with Content-Type application/json
+// is what the Argo CD API actually accepts — the previous raw merge-patch body
+// was rejected by the server. (Envelope added per code review C-01/M-03.)
+type applicationPatchRequest struct {
+	Name      string `json:"name"`
+	Patch     string `json:"patch"`
+	PatchType string `json:"patchType"`
+	Project   string `json:"project,omitempty"`
+}
+
+// patchTypeMerge is the ApplicationService.Patch strategy for a JSON merge
+// patch. The whole-Application Patch endpoint accepts "json" or "merge"; the
+// annotation write-back always uses a merge patch.
+const patchTypeMerge = "merge"
+
+// PatchApplicationAnnotation sets a single annotation (key=value) on the
+// Application's metadata via the Argo CD ApplicationService.Patch endpoint. It
+// is annotation-only: it does not trigger a sync, refresh, or rollback. Callers
+// (the tracker) treat any error as non-fatal and swallow it. A non-2xx response
+// yields an error.
+//
+// The inner {"metadata":{"annotations":{key:value}}} merge patch is wrapped in
+// the official ApplicationPatchRequest envelope (name + patch-as-JSON-string +
+// patchType "merge" + optional project) and sent as application/json, matching
+// the Argo CD REST contract (code review C-01/M-03).
 //
 // Argo CD Notifications subscription annotations (of the form
 // notifications.argoproj.io/subscribe.<trigger>.<service>) are an optional
@@ -160,18 +300,31 @@ func (cl *Client) PatchApplicationAnnotation(ctx context.Context, name, key, val
 	var patch mergePatch
 	patch.Metadata.Annotations = map[string]string{key: value}
 
-	payload, err := json.Marshal(patch)
+	inner, err := json.Marshal(patch)
 	if err != nil {
 		return errors.Wrap(err, "argocd: could not marshal annotation patch")
 	}
 
-	u := cl.applicationURL(name)
+	// Wrap the inner merge patch in the official Argo CD request envelope. The
+	// merge patch is a JSON string in "patch"; the project scope (if any) is in
+	// the body, not the query string (code review C-01/M-03).
+	payload, err := json.Marshal(applicationPatchRequest{
+		Name:      name,
+		Patch:     string(inner),
+		PatchType: patchTypeMerge,
+		Project:   cl.project,
+	})
+	if err != nil {
+		return errors.Wrap(err, "argocd: could not marshal application patch request")
+	}
+
+	u := cl.patchURL(name)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, u, bytes.NewReader(payload))
 	if err != nil {
 		return errors.Wrapf(err, "argocd: could not build patch request for %s", u)
 	}
 	req.Header.Set("Authorization", "Bearer "+cl.token)
-	req.Header.Set("Content-Type", "application/merge-patch+json")
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := cl.httpClient.Do(req)
 	if err != nil {
@@ -185,6 +338,31 @@ func (cl *Client) PatchApplicationAnnotation(ctx context.Context, name, key, val
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return errors.Errorf("argocd: annotation patch to %s returned status %d", u, resp.StatusCode)
+	}
+
+	// Defense-in-depth (code review C-04): confirm the PATCH acted on the
+	// Application we targeted. Argo CD's Patch endpoint echoes the patched
+	// Application; a metadata.name that differs from the requested name means the
+	// write was routed to a different Application (a rename or misroute between
+	// the resolving GET and this PATCH), so reject it. The configured project is
+	// already enforced server-side (a wrong project yields 403 above). The body
+	// is read under the same hard size cap as GET so a runaway response fails
+	// closed (M-04). An absent or non-JSON 2xx body is tolerated — the status
+	// already confirms the write — so best-effort write-back is not defeated by a
+	// server that returns a minimal body.
+	body, err := ioutil.ReadAll(io.LimitReader(resp.Body, maxApplicationResponseBytes+1))
+	if err != nil {
+		return errors.Wrapf(err, "argocd: failed to read patch response body from %s", u)
+	}
+	if int64(len(body)) > maxApplicationResponseBytes {
+		return errors.Errorf("argocd: patch response for %q exceeds %d-byte limit", name, maxApplicationResponseBytes)
+	}
+	var patched Application
+	if err := json.Unmarshal(body, &patched); err != nil {
+		return nil
+	}
+	if got := strings.TrimSpace(patched.Metadata.Name); got != "" && got != name {
+		return errors.Errorf("argocd: annotation patch for %q was applied to a different application %q; refusing to trust write-back", name, got)
 	}
 	return nil
 }
