@@ -131,7 +131,14 @@ func startMySQLContainer() (*exec.Cmd, error) {
 		for !strings.Contains(s, readyString) {
 			s, err = reader.ReadString('\n')
 			if err != nil {
-				return nil, err
+				// Pre-existing test-only compile fix (surfaced by the Argo CD
+				// integration final QA checkpoint): this goroutine closure has
+				// no return values, so the original "return nil, err" did not
+				// compile under -tags docker. Log the read error and stop
+				// reading; the parent select below then reaches its 30s timeout
+				// path and reports the failure safely (fail-safe preserved).
+				fmt.Printf("startMySQLContainer: error reading container stderr: %v\n", err)
+				return
 			}
 			fmt.Print(s)
 		}

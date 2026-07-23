@@ -94,7 +94,7 @@ ca_cert = "/etc/chaosmonkey/argocd-ca.pem"
 timeout = 30
 ```
 
-See the [Configuration File Format](../Configuration-file-format) page for the full
+See the [Configuration File Format](../Configuration-file-format.md) page for the full
 `chaosmonkey.toml` reference.
 
 ## Gate behavior
@@ -317,4 +317,4 @@ never use it in production.
 
 See the [Plugins](index.md) page for info on how to build a custom version of Chaos
 Monkey with your plugin. For the full configuration reference, see the
-[Configuration File Format](../Configuration-file-format) page.
+[Configuration File Format](../Configuration-file-format.md) page.

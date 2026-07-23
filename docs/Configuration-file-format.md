@@ -126,6 +126,6 @@ CD, activate the best-effort write-back by adding `"argocd"` to the `trackers`
 list (for example, `trackers = ["argocd"]`). The write-back sets a single,
 overwritten annotation recording the most recent termination attempt (written
 before the kill, so it records an attempt rather than a confirmed kill). See the
-[Argo CD plugin documentation](plugins/ArgoCD) for full details, including
+[Argo CD plugin documentation](plugins/ArgoCD.md) for full details, including
 authentication/TLS, ApplicationSet annotation preservation, and edge-case
 behavior.
