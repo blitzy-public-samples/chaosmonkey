@@ -23,6 +23,9 @@ import (
 	// These are anonymous imported so that the related Get* methods (e.g.,
 	// GetDecryptor) are picked up.
 
+	// argocd registers the Argo CD pre-flight Precheck gate (deps.GetPrecheck)
+	// and makes the argocd tracker available; feature is inert unless enabled.
+	_ "github.com/Netflix/chaosmonkey/v2/argocd"
 	_ "github.com/Netflix/chaosmonkey/v2/constrainer"
 	_ "github.com/Netflix/chaosmonkey/v2/decryptor"
 	_ "github.com/Netflix/chaosmonkey/v2/env"
