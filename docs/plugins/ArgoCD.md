@@ -161,11 +161,13 @@ The practical effects:
   direct operator control.
 - If the target correlates to more than one eligible `Application` (ambiguous
   ownership), or to none, the gate **fails closed** and skips.
-- Both the gate and the write-back use this **same** resolver logic, so the
-  write-back targets the same `Application` the gate evaluated. They resolve
-  independently (rather than sharing a single result object), so as
-  defense-in-depth the write-back also rejects a PATCH whose response names a
-  different `Application`.
+- This ownership resolution runs **once**, in the gate. The gate-resolved
+  governing `Application` name is carried forward on `Termination.Target`, and the
+  write-back annotates **that** `Application` directly — it does **not** re-resolve
+  ownership. As defense-in-depth the write-back still re-checks that the carried
+  name is one of the operator-configured eligible `Application`s, and the
+  annotation PATCH rejects a response whose `metadata.name` differs from the name
+  it patched.
 
 ## Write-back (event annotation)
 
@@ -196,14 +198,17 @@ it that way requires the Notifications configuration described below.
 The write-back is **best-effort and non-blocking**: on any failure it logs and
 returns `nil`, so a write-back error never blocks or fails a termination (the
 termination workflow otherwise treats a tracker error as fatal). Because the
-tracker runs on the pre-kill path, the whole write-back — target-resolution reads
-plus the annotation PATCH — is bounded by a short independent deadline (the
-smaller of `argocd.timeout` and an internal 5-second cap), so a slow or hung Argo
-CD API cannot stall a termination for the full configured timeout. The write-back
-resolves its target with the **same** strict, globally-unique resolver logic as
-the gate, so it targets the same `Application` the gate evaluated, and as
-defense-in-depth it rejects a PATCH whose response names a different
-`Application`.
+tracker runs on the pre-kill path, the annotation PATCH is bounded by a short
+independent deadline (the smaller of `argocd.timeout` and an internal 5-second
+cap), so a slow or hung Argo CD API cannot stall a termination for the full
+configured timeout. The write-back does **not** re-resolve ownership: it annotates
+the exact `Application` the gate already authorized, carried forward on
+`Termination.Target`, so it always targets the same `Application` the gate
+evaluated. It issues **no** target-resolution GET of its own — an allowed
+termination makes exactly one gate GET plus this one write-back PATCH. Before
+patching, it re-checks that the carried name is one of the operator-configured
+eligible `Application`s, and as defense-in-depth the PATCH rejects a response whose
+`metadata.name` differs from the name it patched.
 
 ### ApplicationSet annotation preservation
 
