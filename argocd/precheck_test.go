@@ -160,7 +160,7 @@ func TestAllow_SyncedHealthy_Allows(t *testing.T) {
 	defer srv.Close()
 
 	p := newArgoPrecheck(t, srv)
-	allowed, reason, err := p.Allow(nil, standardTarget())
+	allowed, reason, target, err := p.Allow(nil, standardTarget())
 	if err != nil {
 		t.Fatalf("Allow returned error %v, want nil", err)
 	}
@@ -169,6 +169,11 @@ func TestAllow_SyncedHealthy_Allows(t *testing.T) {
 	}
 	if reason != "" {
 		t.Errorf("Allow reason = %q, want empty on allow", reason)
+	}
+	// The allow path must return the resolved governing Application name so the
+	// tracker can annotate exactly that identity (Argo CD integration F3/F4/F5).
+	if target != precheckApp {
+		t.Errorf("Allow target = %q, want %q (the gate-resolved governing Application)", target, precheckApp)
 	}
 }
 
@@ -182,12 +187,17 @@ func TestAllow_ResolvesViaGroup_Allows(t *testing.T) {
 
 	p := newArgoPrecheck(t, srv)
 	group := grp.New(precheckApp, "test", "us-east-1", "", "")
-	allowed, reason, err := p.Allow(group, mock.Instance{})
+	allowed, reason, target, err := p.Allow(group, mock.Instance{})
 	if err != nil {
 		t.Fatalf("Allow returned error %v, want nil", err)
 	}
 	if !allowed {
 		t.Errorf("Allow allowed = false, want true (group-resolved Synced+Healthy); reason=%q", reason)
+	}
+	// Group-only resolution must still return the resolved target so the tracker
+	// can write back to it — the exact scenario QA finding F3 covers.
+	if target != precheckApp {
+		t.Errorf("Allow target = %q, want %q (group-resolved governing Application)", target, precheckApp)
 	}
 }
 
@@ -220,7 +230,7 @@ func TestAllow_DeniesUnhealthyOrOutOfSync(t *testing.T) {
 			defer srv.Close()
 
 			p := newArgoPrecheck(t, srv)
-			allowed, reason, err := p.Allow(nil, standardTarget())
+			allowed, reason, _, err := p.Allow(nil, standardTarget())
 			if err != nil {
 				t.Fatalf("Allow returned error %v, want nil (a deny must be graceful)", err)
 			}
@@ -257,7 +267,7 @@ func TestAllow_FailClosed_EmptyResources(t *testing.T) {
 	defer srv.Close()
 
 	p := newArgoPrecheck(t, srv)
-	allowed, reason, err := p.Allow(nil, standardTarget())
+	allowed, reason, _, err := p.Allow(nil, standardTarget())
 	assertGracefulSkip(t, allowed, reason, err)
 	// A reachable, cleanly-evaluated Application that manages no matching live
 	// workload is a clean no-match, reported distinctly from a lookup error.
@@ -273,7 +283,7 @@ func TestAllow_FailClosed_NotFound(t *testing.T) {
 	defer srv.Close()
 
 	p := newArgoPrecheck(t, srv)
-	allowed, reason, err := p.Allow(nil, standardTarget())
+	allowed, reason, _, err := p.Allow(nil, standardTarget())
 	assertGracefulSkip(t, allowed, reason, err)
 	if !contains(reason, "resolve") {
 		t.Errorf("reason %q, want it to mention the unresolved governing Application", reason)
@@ -287,7 +297,7 @@ func TestAllow_FailClosed_Forbidden(t *testing.T) {
 	defer srv.Close()
 
 	p := newArgoPrecheck(t, srv)
-	allowed, reason, err := p.Allow(nil, standardTarget())
+	allowed, reason, _, err := p.Allow(nil, standardTarget())
 	assertGracefulSkip(t, allowed, reason, err)
 	if !contains(reason, "resolve") {
 		t.Errorf("reason %q, want it to mention the unresolved governing Application", reason)
@@ -301,7 +311,7 @@ func TestAllow_FailClosed_ServerError(t *testing.T) {
 	defer srv.Close()
 
 	p := newArgoPrecheck(t, srv)
-	allowed, reason, err := p.Allow(nil, standardTarget())
+	allowed, reason, _, err := p.Allow(nil, standardTarget())
 	assertGracefulSkip(t, allowed, reason, err)
 	if !contains(reason, "resolve") {
 		t.Errorf("reason %q, want it to mention the unresolved governing Application", reason)
@@ -317,7 +327,7 @@ func TestAllow_FailClosed_Unreachable(t *testing.T) {
 	p := newArgoPrecheck(t, srv)
 	srv.Close() // now unreachable; the pending GET will fail to connect.
 
-	allowed, reason, err := p.Allow(nil, standardTarget())
+	allowed, reason, _, err := p.Allow(nil, standardTarget())
 	assertGracefulSkip(t, allowed, reason, err)
 }
 
@@ -336,7 +346,7 @@ func TestAllow_FailClosed_Unresolvable(t *testing.T) {
 	defer srv.Close()
 
 	p := newArgoPrecheck(t, srv)
-	allowed, reason, err := p.Allow(nil, standardTarget())
+	allowed, reason, _, err := p.Allow(nil, standardTarget())
 	assertGracefulSkip(t, allowed, reason, err)
 	// The Application evaluated cleanly but manages a different workload, so this
 	// is a clean no-match rather than a lookup error.
@@ -357,7 +367,7 @@ func TestAllow_FailClosed_NoEligibleApplications(t *testing.T) {
 		mapper:  NewMapper(nil), // no eligible Applications configured
 		timeout: 2 * time.Second,
 	}
-	allowed, reason, err := p.Allow(nil, standardTarget())
+	allowed, reason, _, err := p.Allow(nil, standardTarget())
 	assertGracefulSkip(t, allowed, reason, err)
 	if !contains(reason, "no eligible") {
 		t.Errorf("reason %q, want it to mention that no eligible Applications are configured", reason)
@@ -381,7 +391,7 @@ func TestGetPrecheck_DisabledReturnsAllowAll(t *testing.T) {
 	if _, ok := p.(allowAllPrecheck); !ok {
 		t.Errorf("GetPrecheck(disabled) returned %T, want allowAllPrecheck", p)
 	}
-	allowed, reason, err := p.Allow(nil, mock.Instance{App: "foo"})
+	allowed, reason, target, err := p.Allow(nil, mock.Instance{App: "foo"})
 	if err != nil {
 		t.Fatalf("allow-all Allow error = %v, want nil", err)
 	}
@@ -390,6 +400,11 @@ func TestGetPrecheck_DisabledReturnsAllowAll(t *testing.T) {
 	}
 	if reason != "" {
 		t.Errorf("allow-all Allow reason = %q, want empty", reason)
+	}
+	// The inert allow-all provider resolves no target, so a downstream tracker
+	// has nothing to write back to (the feature is fully inert when disabled).
+	if target != "" {
+		t.Errorf("allow-all Allow target = %q, want empty", target)
 	}
 }
 
@@ -446,12 +461,17 @@ func TestGetPrecheck_EnabledEndToEnd_Allows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetPrecheck(enabled) error = %v, want nil", err)
 	}
-	allowed, reason, err := p.Allow(nil, standardTarget())
+	allowed, reason, target, err := p.Allow(nil, standardTarget())
 	if err != nil {
 		t.Fatalf("Allow error = %v, want nil", err)
 	}
 	if !allowed {
 		t.Errorf("Allow allowed = false, want true (full factory->client->gate wiring); reason=%q", reason)
+	}
+	// End-to-end through the real factory: the resolved governing Application
+	// name must flow back so the tracker annotates it (F3/F4/F5).
+	if target != precheckApp {
+		t.Errorf("Allow target = %q, want %q (end-to-end gate-resolved Application)", target, precheckApp)
 	}
 }
 
@@ -538,7 +558,7 @@ func TestAllow_CrossAppAmbiguity_Denies(t *testing.T) {
 	defer srv.Close()
 
 	p := newArgoPrecheckMulti(t, srv, []string{"appA", "appB"})
-	allowed, reason, err := p.Allow(nil, mock.Instance{App: "shared", Cluster: "shared"})
+	allowed, reason, _, err := p.Allow(nil, mock.Instance{App: "shared", Cluster: "shared"})
 	assertGracefulSkip(t, allowed, reason, err)
 	if !contains(reason, "ambiguous") {
 		t.Errorf("reason %q, want it to report ambiguous ownership", reason)
@@ -559,7 +579,7 @@ func TestAllow_PartialLookupError_Denies(t *testing.T) {
 	defer srv.Close()
 
 	p := newArgoPrecheckMulti(t, srv, []string{"appA", "appB"})
-	allowed, reason, err := p.Allow(nil, mock.Instance{App: "web", Cluster: "web"})
+	allowed, reason, _, err := p.Allow(nil, mock.Instance{App: "web", Cluster: "web"})
 	assertGracefulSkip(t, allowed, reason, err)
 	if !contains(reason, "unique ownership") {
 		t.Errorf("reason %q, want it to report that unique ownership could not be proven", reason)
@@ -579,7 +599,7 @@ func TestAllow_ReturnedNameMismatch_Denies(t *testing.T) {
 	defer srv.Close()
 
 	p := newArgoPrecheckMulti(t, srv, []string{"appA"})
-	allowed, reason, err := p.Allow(nil, mock.Instance{App: "web", Cluster: "web"})
+	allowed, reason, _, err := p.Allow(nil, mock.Instance{App: "web", Cluster: "web"})
 	assertGracefulSkip(t, allowed, reason, err)
 	if !contains(reason, "different Application") {
 		t.Errorf("reason %q, want it to report the returned-name mismatch", reason)
@@ -601,12 +621,18 @@ func TestAllow_SingleOwnerAmongMany_Allows(t *testing.T) {
 	defer srv.Close()
 
 	p := newArgoPrecheckMulti(t, srv, []string{"appA", "appB", "appC"})
-	allowed, reason, err := p.Allow(nil, mock.Instance{App: "target-wl", Cluster: "target-wl"})
+	allowed, reason, target, err := p.Allow(nil, mock.Instance{App: "target-wl", Cluster: "target-wl"})
 	if err != nil {
 		t.Fatalf("Allow error = %v, want nil", err)
 	}
 	if !allowed {
 		t.Errorf("Allow allowed = false, want true (unique owner among many eligible Applications); reason=%q", reason)
+	}
+	// Among several eligible Applications, only appB manages the target workload,
+	// so appB must be the resolved target carried to the tracker (F5 guards that
+	// a later ownership change cannot redirect the write-back elsewhere).
+	if target != "appB" {
+		t.Errorf("Allow target = %q, want %q (the unique governing Application)", target, "appB")
 	}
 }
 
@@ -646,7 +672,7 @@ func TestAllow_NilProviderFields_FailClosed(t *testing.T) {
 	for _, tc := range tests {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			allowed, reason, err := tc.p.Allow(nil, standardTarget())
+			allowed, reason, _, err := tc.p.Allow(nil, standardTarget())
 			assertGracefulSkip(t, allowed, reason, err)
 			if !contains(reason, "not fully initialized") {
 				t.Errorf("reason %q, want it to report the uninitialized provider", reason)
@@ -671,7 +697,7 @@ func TestAllow_SanitizesInjectedStatusInReason(t *testing.T) {
 	defer srv.Close()
 
 	p := newArgoPrecheck(t, srv)
-	allowed, reason, err := p.Allow(nil, standardTarget())
+	allowed, reason, _, err := p.Allow(nil, standardTarget())
 	assertGracefulSkip(t, allowed, reason, err)
 
 	// The decoded newline must have been escaped away — no raw newline may reach

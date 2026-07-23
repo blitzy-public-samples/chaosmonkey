@@ -7,7 +7,7 @@ nav:
   - Home: index.md
   - How to deploy: How-to-deploy.md
   - Configuration file format: Configuration-file-format.md
-  - Configuring behavior via Spinnaker: Configuring-behavior-via-spinnaker.md
+  - Configuring behavior via Spinnaker: Configuring-behavior-via-Spinnaker.md
   - Termination behaior: Termination-behavior.md
   - Running locally: Running-locally.md
   - Plugins:

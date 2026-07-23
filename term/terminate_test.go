@@ -206,18 +206,40 @@ func TestDoesNotTerminateIfAppIsDisabled(t *testing.T) {
 type stubPrecheck struct {
 	allowed bool
 	reason  string
+	target  string
 	err     error
 	calls   int
 }
 
-// Allow satisfies chaosmonkey.Precheck.
-func (p *stubPrecheck) Allow(group grp.InstanceGroup, instance chaosmonkey.Instance) (bool, string, error) {
+// Allow satisfies chaosmonkey.Precheck. It returns the fixed target so the
+// orchestration test can prove the gate-resolved target is carried onto the
+// Termination (Argo CD integration, QA findings F3/F4/F5).
+func (p *stubPrecheck) Allow(group grp.InstanceGroup, instance chaosmonkey.Instance) (bool, string, string, error) {
 	p.calls++
-	return p.allowed, p.reason, p.err
+	return p.allowed, p.reason, p.target, p.err
 }
 
 // Compile-time proof the stub satisfies the additive gate contract.
 var _ chaosmonkey.Precheck = (*stubPrecheck)(nil)
+
+// recordingTracker is a test-only chaosmonkey.Tracker that captures the last
+// Termination it received, so a test can prove the gate-resolved target is
+// carried onto Termination.Target and handed to trackers (Argo CD integration,
+// QA findings F3/F4/F5).
+type recordingTracker struct {
+	last  chaosmonkey.Termination
+	calls int
+}
+
+// Track satisfies chaosmonkey.Tracker; it records the termination and succeeds.
+func (t *recordingTracker) Track(trm chaosmonkey.Termination) error {
+	t.calls++
+	t.last = trm
+	return nil
+}
+
+// Compile-time proof the recording tracker satisfies the contract.
+var _ chaosmonkey.Tracker = (*recordingTracker)(nil)
 
 // TestTerminatePrecheckGate is the orchestration proof (code review M-05) that
 // term.doTerminate wires the additive Argo CD pre-flight gate correctly: an
@@ -230,16 +252,21 @@ func TestTerminatePrecheckGate(t *testing.T) {
 		precheck   *stubPrecheck
 		wantErr    bool
 		wantNcalls int
+		wantTarget string
 	}{
-		{"allow proceeds to the kill", &stubPrecheck{allowed: true}, false, 1},
-		{"deny skips termination without error", &stubPrecheck{allowed: false, reason: "argocd: application not synced"}, false, 0},
-		{"gate error fails closed and propagates", &stubPrecheck{allowed: false, err: errors.New("argocd unreachable")}, true, 0},
+		{"allow proceeds to the kill", &stubPrecheck{allowed: true, target: "argocd-app-x"}, false, 1, "argocd-app-x"},
+		{"deny skips termination without error", &stubPrecheck{allowed: false, reason: "argocd: application not synced"}, false, 0, ""},
+		{"gate error fails closed and propagates", &stubPrecheck{allowed: false, err: errors.New("argocd unreachable")}, true, 0, ""},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			d := mockDeps()
 			d.Precheck = tc.precheck
+			// Attach a recording tracker so we can assert the gate-resolved
+			// target is carried onto the Termination and handed to trackers.
+			rec := &recordingTracker{}
+			d.Trackers = []chaosmonkey.Tracker{rec}
 
 			err := Terminate(d, "foo", "prod", "us-east-1", "", "foo-prod")
 			if tc.wantErr && err == nil {
@@ -255,6 +282,18 @@ func TestTerminatePrecheckGate(t *testing.T) {
 			}
 			if tc.precheck.calls != 1 {
 				t.Errorf("precheck consulted %d times, want exactly 1", tc.precheck.calls)
+			}
+
+			// When the gate allowed and the termination proceeded, the
+			// gate-resolved target must have been carried onto Termination.Target
+			// and handed to the tracker (the term.go wiring for F3/F4/F5).
+			if tc.wantNcalls > 0 {
+				if rec.calls != 1 {
+					t.Errorf("tracker consulted %d times, want exactly 1", rec.calls)
+				}
+				if rec.last.Target != tc.wantTarget {
+					t.Errorf("tracker received Termination.Target=%q, want %q", rec.last.Target, tc.wantTarget)
+				}
 			}
 		})
 	}

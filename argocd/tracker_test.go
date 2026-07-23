@@ -17,14 +17,25 @@ package argocd
 // White-box unit tests for tracker.go. They are the executable proof of the
 // best-effort, NON-BLOCKING write-back contract (AAP 0.5.3): argoTracker.Track
 // MUST return nil on success AND on every failure mode (server 5xx/4xx,
-// unreachable endpoint, unresolved Application, nil client), because
-// term.doTerminate treats a tracker error as fatal to a termination that has
-// already been recorded. NewTracker is likewise lenient: it must NEVER return a
-// non-nil error, degrading instead to a safe no-op tracker. The success path
-// additionally asserts the write-back payload: a PATCH carrying the
+// unreachable endpoint, no carried target, ineligible target, nil client),
+// because term.doTerminate treats a tracker error as fatal to a termination that
+// has already been recorded. NewTracker is likewise lenient: it must NEVER
+// return a non-nil error, degrading instead to a safe no-op tracker. The success
+// path additionally asserts the write-back payload: a PATCH carrying the
 // chaosmonkey.netflix.com/last-termination annotation whose value JSON-decodes
 // to {instance, time, leashed} — the record that surfaces the chaos action on
 // the Argo CD timeline (User Example Flow 2).
+//
+// Carried-target model (QA findings F3/F4/F5): the tracker no longer
+// independently re-resolves Application ownership. term.doTerminate carries the
+// gate-resolved governing Application name forward on Termination.Target, and the
+// tracker writes back to exactly that identity — issuing NO resolution GET, only
+// the annotation PATCH. These tests therefore set Termination.Target directly and
+// assert the tracker honors it (writes to that Application, skips when it is
+// empty or ineligible, and never issues a resolution GET). The correctness of the
+// resolution itself (global uniqueness, ambiguity/partial-error/name-mismatch
+// denial) is proven where it now lives — the gate — in precheck_test.go and
+// mapper_test.go.
 //
 // Framework: these tests use ONLY the standard-library testing and
 // net/http/httptest packages, matching every other test in this module (no test
@@ -35,14 +46,13 @@ package argocd
 // change the feature's minimal-change contract forbids. Plain stdlib testing is
 // therefore the required choice.
 //
-// Adaptation note: the delivered target-resolution engine (mapper.go) is
-// fail-closed and binds ownership to an Application's authoritative
-// status.resources[] inventory — it never infers ownership from a bare
-// Application-name coincidence, and an empty eligibility allow-list resolves
-// NOTHING. The success/error tests therefore configure argocd.enabled, an
-// endpoint, a (fake) token, and an explicit argocd.applications allow-list, and
-// serve an Application whose resources map to the target, so a real PATCH
-// write-back is exercised end-to-end through the public NewTracker constructor.
+// Adaptation note: because the tracker writes back to the carried
+// Termination.Target rather than re-resolving, the success/error tests configure
+// argocd.enabled, an endpoint, a (fake) token, and an explicit
+// argocd.applications allow-list (whose membership the tracker re-checks with
+// Mapper.IsEligible as belt-and-suspenders), set Termination.Target to the
+// authorized Application name, and assert a real PATCH write-back is exercised
+// end-to-end through the public NewTracker constructor.
 
 import (
 	"bytes"
@@ -80,21 +90,6 @@ const resolvableAppJSON = `{
   }
 }`
 
-// otherAppJSON is an eligible-but-non-matching Application: it is named "other"
-// and manages only a workload named "other", so it can never own a target whose
-// identifiers are {my-app, foo}. It is used to prove resolution denial without
-// any name-coincidence shortcut.
-const otherAppJSON = `{
-  "metadata": {"name": "other"},
-  "status": {
-    "sync":   {"status": "Synced"},
-    "health": {"status": "Healthy"},
-    "resources": [
-      {"group": "apps", "kind": "Deployment", "name": "other", "health": {"status": "Healthy"}}
-    ]
-  }
-}`
-
 // fixedTerminationTimeRFC3339 is the RFC3339 rendering of the deterministic
 // termination timestamp used by the payload assertion.
 const fixedTerminationTimeRFC3339 = "2023-01-02T03:04:05Z"
@@ -109,11 +104,17 @@ func fixedTerminationTime() time.Time {
 // i-123 in cluster "my-app" (app "foo"), terminated at the fixed time, not
 // leashed. The chaosmonkey.Termination type carries no termination identifier,
 // so the instance id is the subject recorded in the annotation.
+//
+// Target is set to "my-app" — the governing Application name the sync/health gate
+// would have resolved and authorized. The tracker writes back to this carried
+// identity directly (no resolution GET), so the tests that exercise a real PATCH
+// pair this with an allow-list that includes "my-app".
 func stdTermination() chaosmonkey.Termination {
 	return chaosmonkey.Termination{
 		Instance: mock.Instance{App: "foo", Cluster: "my-app", InstanceID: "i-123"},
 		Time:     fixedTerminationTime(),
 		Leashed:  false,
+		Target:   "my-app",
 	}
 }
 
@@ -133,11 +134,12 @@ type capturedPatch struct {
 }
 
 // patchCapture records the annotation write-back (PATCH) request observed by a
-// test server. Only PATCH requests are recorded; the GET issued during target
-// resolution is answered but not captured, so a write-back that never happens
-// leaves the capture empty (seen == false). It is mutex-guarded so an assertion
-// made after Track returns is race-clean even though httptest serves each
-// request on its own goroutine.
+// test server. Only PATCH requests are recorded; a write-back that never happens
+// leaves the capture empty (seen == false). (The reworked tracker issues no
+// resolution GET — it writes back to the carried Termination.Target — so a GET
+// arriving at one of these servers would itself indicate a regression.) It is
+// mutex-guarded so an assertion made after Track returns is race-clean even
+// though httptest serves each request on its own goroutine.
 type patchCapture struct {
 	mu           sync.Mutex
 	seen         bool
@@ -178,11 +180,12 @@ func (c *patchCapture) snapshot() capturedPatch {
 }
 
 // newServer returns an httptest.Server that emulates the subset of the Argo CD
-// REST API the tracker uses. A GET (target resolution) is answered with getBody
-// when getStatus is 200, or with a bare getStatus otherwise. A PATCH (annotation
-// write-back) is answered with patchStatus and, when pc is non-nil, its method,
-// path, application/json Content-Type, and decoded annotations are recorded into
-// pc. Any other method yields 405.
+// REST API used in these tests. A GET is answered with getBody when getStatus is
+// 200, or with a bare getStatus otherwise (retained for completeness; the
+// reworked tracker issues no resolution GET). A PATCH (annotation write-back) is
+// answered with patchStatus and, when pc is non-nil, its method, path,
+// application/json Content-Type, and decoded annotations are recorded into pc.
+// Any other method yields 405.
 //
 // The PATCH body is the Argo CD ApplicationPatchRequest envelope introduced by
 // code review C-01/M-03: an outer {name, patch, patchType, project} object whose
@@ -332,24 +335,26 @@ func TestTrack_Success_WritesAnnotation(t *testing.T) {
 	}
 }
 
-// TestTrack_ServerError_ReturnsNil proves Track swallows every HTTP-status
-// failure — whether target resolution (GET) or the annotation write (PATCH)
-// fails — and still returns nil, so a write-back error can never fail a
-// termination.
+// TestTrack_ServerError_ReturnsNil proves Track swallows every annotation-write
+// HTTP-status failure (PATCH 5xx/4xx) and still returns nil, so a write-back
+// error can never fail a termination. The tracker issues no resolution GET, so
+// only the PATCH status is varied here.
 func TestTrack_ServerError_ReturnsNil(t *testing.T) {
 	cases := []struct {
 		name        string
-		getStatus   int
 		patchStatus int
 	}{
-		{"GET 500 fails resolution", http.StatusInternalServerError, http.StatusOK},
-		{"GET 404 missing application", http.StatusNotFound, http.StatusOK},
-		{"GET 403 forbidden", http.StatusForbidden, http.StatusOK},
-		{"PATCH 500 write-back fails", http.StatusOK, http.StatusInternalServerError},
+		{"PATCH 500 internal server error", http.StatusInternalServerError},
+		{"PATCH 404 application missing", http.StatusNotFound},
+		{"PATCH 403 forbidden (wrong project)", http.StatusForbidden},
+		{"PATCH 409 conflict", http.StatusConflict},
+		{"PATCH 401 unauthorized", http.StatusUnauthorized},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv := newServer(tc.getStatus, resolvableAppJSON, tc.patchStatus, nil)
+			// getStatus is irrelevant now (the tracker issues no GET); the
+			// annotation PATCH is answered with the failing status.
+			srv := newServer(http.StatusOK, resolvableAppJSON, tc.patchStatus, nil)
 			defer srv.Close()
 
 			tr, err := NewTracker(enabledMonkey(srv.URL, []string{"my-app"}))
@@ -357,15 +362,15 @@ func TestTrack_ServerError_ReturnsNil(t *testing.T) {
 				t.Fatalf("NewTracker returned error %v, want nil", err)
 			}
 			if err := tr.Track(stdTermination()); err != nil {
-				t.Fatalf("Track returned %v, want nil", err)
+				t.Fatalf("Track returned %v, want nil (a write-back HTTP error must never fail a termination)", err)
 			}
 		})
 	}
 }
 
 // TestTrack_Unreachable_ReturnsNil proves that when the Argo CD endpoint is
-// unreachable (the server has been closed, so connections are refused) target
-// resolution fails and Track still returns nil.
+// unreachable (the server has been closed, so connections are refused) the
+// annotation PATCH fails and Track still returns nil.
 func TestTrack_Unreachable_ReturnsNil(t *testing.T) {
 	srv := newServer(http.StatusOK, resolvableAppJSON, http.StatusOK, nil)
 	deadURL := srv.URL
@@ -380,28 +385,54 @@ func TestTrack_Unreachable_ReturnsNil(t *testing.T) {
 	}
 }
 
-// TestTrack_UnresolvedApplication_ReturnsNil proves that when no governing
-// Application can be resolved for the target — here the only eligible
-// Application ("other") does not manage the terminated instance — Track returns
-// nil and performs NO write-back PATCH (the capture stays empty). Resolution is
-// bound to the Application's authoritative status.resources[] inventory, so a
-// non-matching eligible Application is correctly rejected before any write.
-func TestTrack_UnresolvedApplication_ReturnsNil(t *testing.T) {
+// TestTrack_IneligibleTarget_SkipsWriteBack proves the tracker's defense-in-depth
+// eligibility re-check: when the carried Termination.Target is not one of the
+// operator-configured eligible Applications, the tracker skips the write-back
+// entirely (no PATCH) and still returns nil. Here the allow-list is ["other"] but
+// the carried target is "my-app", so Mapper.IsEligible("my-app") is false and the
+// write-back is refused before any network call.
+func TestTrack_IneligibleTarget_SkipsWriteBack(t *testing.T) {
 	pc := &patchCapture{}
-	srv := newServer(http.StatusOK, otherAppJSON, http.StatusOK, pc)
+	srv := newServer(http.StatusOK, resolvableAppJSON, http.StatusOK, pc)
 	defer srv.Close()
 
-	// The eligible allow-list is ["other"], but the termination targets cluster
-	// "my-app"/app "foo", which "other" does not manage.
+	// Allow-list ["other"] does NOT include the carried target "my-app".
 	tr, err := NewTracker(enabledMonkey(srv.URL, []string{"other"}))
 	if err != nil {
 		t.Fatalf("NewTracker returned error %v, want nil", err)
 	}
 	if err := tr.Track(stdTermination()); err != nil {
-		t.Fatalf("Track for an unresolved Application returned %v, want nil", err)
+		t.Fatalf("Track for an ineligible target returned %v, want nil", err)
 	}
 	if got := pc.snapshot(); got.seen {
-		t.Errorf("expected NO write-back PATCH when resolution fails, but the server recorded one: %+v", got)
+		t.Errorf("expected NO write-back PATCH when the carried target is not eligible, but the server recorded one: %+v", got)
+	}
+}
+
+// TestTrack_NoCarriedTarget_SkipsWriteBack proves the tracker never guesses a
+// target: when Termination.Target is empty (or whitespace-only) — e.g. the gate
+// resolved nothing — the tracker skips the write-back entirely (no PATCH) and
+// returns nil. This is the tracker side of the F3 guarantee.
+func TestTrack_NoCarriedTarget_SkipsWriteBack(t *testing.T) {
+	for _, target := range []string{"", "   "} {
+		t.Run("target="+target, func(t *testing.T) {
+			pc := &patchCapture{}
+			srv := newServer(http.StatusOK, resolvableAppJSON, http.StatusOK, pc)
+			defer srv.Close()
+
+			tr, err := NewTracker(enabledMonkey(srv.URL, []string{"my-app"}))
+			if err != nil {
+				t.Fatalf("NewTracker returned error %v, want nil", err)
+			}
+			trm := stdTermination()
+			trm.Target = target
+			if err := tr.Track(trm); err != nil {
+				t.Fatalf("Track with empty target %q returned %v, want nil", target, err)
+			}
+			if got := pc.snapshot(); got.seen {
+				t.Errorf("expected NO write-back PATCH when no target is carried, but the server recorded one: %+v", got)
+			}
+		})
 	}
 }
 
@@ -476,17 +507,20 @@ func TestNewTracker_NeverErrors(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
-// Adversarial write-back tests (code review C-04, M-01, M-02). These prove the
-// tracker resolves the write-back target with the SAME shared, fail-closed,
-// globally-unique resolver the gate uses (so it can never annotate a different
-// Application), bounds the write-back on the pre-kill path, and records a
-// truthful pre-execution attempt — all while never surfacing an error.
+// Adversarial write-back tests (QA findings F3/F4/F5; code review C-04, M-01,
+// M-02). These prove the tracker writes back to EXACTLY the carried
+// Termination.Target the gate authorized — issuing no resolution GET (F4) and
+// never redirecting to a different Application even if ownership changed after
+// the gate (F5) — bounds the write-back on the pre-kill path (M-01), and records
+// a truthful pre-execution attempt (M-02) — all while never surfacing an error.
+// (Resolution correctness itself — global uniqueness, ambiguity/partial-error/
+// name-mismatch denial — is proven at the gate in precheck_test.go and
+// mapper_test.go, which is where re-resolution now exclusively lives.)
 //
-// They need a path-aware server that answers each Application name differently
-// AND captures PATCH requests; the shared newServer answers every name with the
-// same body. newCapturingMultiAppServer provides that; the path-aware GET
-// fixtures (appResponse, appPathPrefix, oneWorkloadApp) are declared in
-// precheck_test.go and reused here (same package).
+// Some of these still use a path-aware server that captures PATCH requests and
+// can echo a chosen metadata.name (to exercise the client's PATCH-response name
+// check); the path-aware fixtures (appResponse, appPathPrefix, oneWorkloadApp)
+// are declared in precheck_test.go and reused here (same package).
 // -----------------------------------------------------------------------------
 
 // newCapturingMultiAppServer starts a path-aware server that answers
@@ -583,139 +617,104 @@ func TestWriteBackBudget(t *testing.T) {
 	}
 }
 
-// TestTrack_SingleOwnerAmongMany_WritesToResolvedApp proves the C-04 same-target
-// guarantee: among three eligible Applications, only appB manages the terminated
-// instance's workload, so the write-back PATCH must land on appB (never appA or
-// appC). It also confirms the PATCH re-confirms the target — the server echoes
-// metadata.name "appB", which the client accepts.
-func TestTrack_SingleOwnerAmongMany_WritesToResolvedApp(t *testing.T) {
-	routes := map[string]appResponse{
-		"appA": {http.StatusOK, oneWorkloadApp("appA", SyncStatusSynced, HealthStatusHealthy, "web-a")},
-		"appB": {http.StatusOK, oneWorkloadApp("appB", SyncStatusSynced, HealthStatusHealthy, "web-b")},
-		"appC": {http.StatusOK, oneWorkloadApp("appC", SyncStatusSynced, HealthStatusHealthy, "web-c")},
-	}
-	pc := &patchCapture{}
-	srv := newCapturingMultiAppServer(t, routes, pc, nil)
+// TestTrack_UsesCarriedTarget_NoResolutionGET is the core proof for QA findings
+// F3/F4/F5: the tracker writes back to EXACTLY the carried Termination.Target and
+// issues NO target-resolution GET. Although three Applications are eligible and
+// the terminated instance's identifiers do NOT name appB, the tracker consults
+// no GET to derive ownership — it PATCHes appB solely because that is the
+// gate-authorized target. A counting server observes zero GETs and exactly one
+// PATCH, to appB.
+//
+// This replaces the previous instance-only re-resolution tracker tests
+// (single-owner, cross-app ambiguity, partial-lookup, returned-name-mismatch):
+// re-resolution no longer happens in the tracker, so those scenarios are now
+// proven at the gate in precheck_test.go (TestAllow_SingleOwnerAmongMany_Allows,
+// TestAllow_CrossAppAmbiguity_Denies, TestAllow_PartialLookupError_Denies,
+// TestAllow_ReturnedNameMismatch_Denies) and mapper_test.go.
+func TestTrack_UsesCarriedTarget_NoResolutionGET(t *testing.T) {
+	var mu sync.Mutex
+	var getCount, patchCount int
+	var patchPath, patchName string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			// A resolution GET here would itself be an F4 regression; count it
+			// (the assertions below fail if it is non-zero) but still answer so a
+			// stray call cannot masquerade as a connection error.
+			mu.Lock()
+			getCount++
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(oneWorkloadApp("appB", SyncStatusSynced, HealthStatusHealthy, "web-b")))
+		case http.MethodPatch:
+			var env struct {
+				Name  string `json:"name"`
+				Patch string `json:"patch"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&env)
+			mu.Lock()
+			patchCount++
+			patchPath = r.URL.Path
+			patchName = env.Name
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"metadata":{"name":"` + env.Name + `"}}`))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
 	defer srv.Close()
 
 	tr := newArgoTracker(t, srv, []string{"appA", "appB", "appC"}, 2*time.Second)
+	// The gate authorized appB; carry that identity forward. The instance
+	// identifiers deliberately do NOT name appB, proving the tracker uses the
+	// carried target rather than re-deriving one from the instance.
 	trm := chaosmonkey.Termination{
 		Instance: mock.Instance{App: "foo", Cluster: "web-b", InstanceID: "i-b"},
 		Time:     fixedTerminationTime(),
+		Target:   "appB",
 	}
 	if err := tr.Track(trm); err != nil {
 		t.Fatalf("Track returned %v, want nil", err)
 	}
 
-	got := pc.snapshot()
-	if !got.seen {
-		t.Fatal("expected a write-back PATCH to the resolved Application, but none was recorded")
+	mu.Lock()
+	defer mu.Unlock()
+	if getCount != 0 {
+		t.Errorf("tracker issued %d resolution GET(s), want 0 (F4: no re-resolution)", getCount)
 	}
-	if want := appPathPrefix + "appB"; got.path != want {
-		t.Errorf("write-back path = %q, want %q (must target the ONE Application that manages the target)", got.path, want)
+	if patchCount != 1 {
+		t.Errorf("tracker issued %d PATCH(es), want exactly 1", patchCount)
 	}
-	if want := "appB"; got.envelopeName != want {
-		t.Errorf("write-back envelope name = %q, want %q", got.envelopeName, want)
+	if want := appPathPrefix + "appB"; patchPath != want {
+		t.Errorf("write-back path = %q, want %q (must target the carried, gate-authorized Application)", patchPath, want)
 	}
-}
-
-// TestTrack_CrossAppAmbiguity_SkipsWriteBack proves the C-04/C-03 boundary for
-// the tracker: when TWO eligible Applications each manage a live workload
-// matching the target, ownership is ambiguous, so the tracker must skip the
-// write-back entirely (no PATCH) and still return nil.
-func TestTrack_CrossAppAmbiguity_SkipsWriteBack(t *testing.T) {
-	routes := map[string]appResponse{
-		"appA": {http.StatusOK, oneWorkloadApp("appA", SyncStatusSynced, HealthStatusHealthy, "shared")},
-		"appB": {http.StatusOK, oneWorkloadApp("appB", SyncStatusSynced, HealthStatusHealthy, "shared")},
-	}
-	pc := &patchCapture{}
-	srv := newCapturingMultiAppServer(t, routes, pc, nil)
-	defer srv.Close()
-
-	tr := newArgoTracker(t, srv, []string{"appA", "appB"}, 2*time.Second)
-	trm := chaosmonkey.Termination{
-		Instance: mock.Instance{App: "shared", Cluster: "shared", InstanceID: "i-x"},
-		Time:     fixedTerminationTime(),
-	}
-	if err := tr.Track(trm); err != nil {
-		t.Fatalf("Track returned %v, want nil (best-effort)", err)
-	}
-	if got := pc.snapshot(); got.seen {
-		t.Errorf("expected NO write-back under ambiguous ownership, but a PATCH was recorded: %+v", got)
-	}
-}
-
-// TestTrack_PartialLookupError_SkipsWriteBack proves the tracker inherits the
-// resolver's uniqueness-proof requirement: appA cleanly manages the target but
-// appB (also eligible) fails to fetch, so unique ownership cannot be proven and
-// the tracker skips the write-back rather than annotating appA under
-// uncertainty.
-func TestTrack_PartialLookupError_SkipsWriteBack(t *testing.T) {
-	routes := map[string]appResponse{
-		"appA": {http.StatusOK, oneWorkloadApp("appA", SyncStatusSynced, HealthStatusHealthy, "web-a")},
-		"appB": {http.StatusInternalServerError, ""},
-	}
-	pc := &patchCapture{}
-	srv := newCapturingMultiAppServer(t, routes, pc, nil)
-	defer srv.Close()
-
-	tr := newArgoTracker(t, srv, []string{"appA", "appB"}, 2*time.Second)
-	trm := chaosmonkey.Termination{
-		Instance: mock.Instance{App: "foo", Cluster: "web-a", InstanceID: "i-a"},
-		Time:     fixedTerminationTime(),
-	}
-	if err := tr.Track(trm); err != nil {
-		t.Fatalf("Track returned %v, want nil (best-effort)", err)
-	}
-	if got := pc.snapshot(); got.seen {
-		t.Errorf("expected NO write-back when uniqueness cannot be proven, but a PATCH was recorded: %+v", got)
-	}
-}
-
-// TestTrack_ReturnedNameMismatch_SkipsWriteBack proves the resolver's defensive
-// GET name check protects the tracker: the only eligible Application "appA"
-// returns a body whose metadata.name is "someone-else", so it is treated as an
-// evaluation failure (not a match) and the tracker skips the write-back.
-func TestTrack_ReturnedNameMismatch_SkipsWriteBack(t *testing.T) {
-	routes := map[string]appResponse{
-		"appA": {http.StatusOK, oneWorkloadApp("someone-else", SyncStatusSynced, HealthStatusHealthy, "web-a")},
-	}
-	pc := &patchCapture{}
-	srv := newCapturingMultiAppServer(t, routes, pc, nil)
-	defer srv.Close()
-
-	tr := newArgoTracker(t, srv, []string{"appA"}, 2*time.Second)
-	trm := chaosmonkey.Termination{
-		Instance: mock.Instance{App: "foo", Cluster: "web-a", InstanceID: "i-a"},
-		Time:     fixedTerminationTime(),
-	}
-	if err := tr.Track(trm); err != nil {
-		t.Fatalf("Track returned %v, want nil (best-effort)", err)
-	}
-	if got := pc.snapshot(); got.seen {
-		t.Errorf("expected NO write-back when the GET returns a different Application, but a PATCH was recorded: %+v", got)
+	if patchName != "appB" {
+		t.Errorf("write-back envelope name = %q, want %q", patchName, "appB")
 	}
 }
 
 // TestTrack_PatchResponseNameMismatch_ReturnsNil proves the C-04 PATCH
-// defense-in-depth: resolution succeeds (GET for appA echoes "appA"), the PATCH
-// is issued, but the PATCH response echoes a DIFFERENT metadata.name
-// ("hijacked") — a rename/misroute between the GET and the PATCH. The client
+// defense-in-depth still holds under the carried-target model: the PATCH to the
+// carried target "appA" is issued, but the PATCH response echoes a DIFFERENT
+// metadata.name ("hijacked") — a rename/misroute at write time. The client
 // rejects the untrustworthy write-back with an error, which the best-effort
 // tracker swallows and returns nil.
 func TestTrack_PatchResponseNameMismatch_ReturnsNil(t *testing.T) {
-	routes := map[string]appResponse{
-		"appA": {http.StatusOK, oneWorkloadApp("appA", SyncStatusSynced, HealthStatusHealthy, "web-a")},
-	}
 	pc := &patchCapture{}
-	// Force the PATCH response for "appA" to echo a different metadata.name.
-	srv := newCapturingMultiAppServer(t, routes, pc, map[string]string{"appA": "hijacked"})
+	// The routes GET fixture is unused by the reworked tracker (it issues no
+	// resolution GET); only the PATCH-response name override matters here — it
+	// forces the PATCH response for "appA" to echo a different metadata.name.
+	srv := newCapturingMultiAppServer(t, nil, pc, map[string]string{"appA": "hijacked"})
 	defer srv.Close()
 
 	tr := newArgoTracker(t, srv, []string{"appA"}, 2*time.Second)
+	// The gate authorized appA; carry that identity forward.
 	trm := chaosmonkey.Termination{
 		Instance: mock.Instance{App: "foo", Cluster: "web-a", InstanceID: "i-a"},
 		Time:     fixedTerminationTime(),
+		Target:   "appA",
 	}
 	if err := tr.Track(trm); err != nil {
 		t.Fatalf("Track returned %v, want nil even when the PATCH response name mismatches", err)
@@ -736,7 +735,7 @@ func TestTrack_SlowServer_BoundedReturnsNil(t *testing.T) {
 	budget := 100 * time.Millisecond
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Stall every request (including the resolving GET) beyond the budget.
+		// Stall every request (the annotation PATCH) beyond the budget.
 		time.Sleep(stall)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(resolvableAppJSON))
@@ -764,18 +763,19 @@ func TestTrack_SlowServer_BoundedReturnsNil(t *testing.T) {
 
 // TestTrack_SanitizesInstanceIDInSkipLog proves the Q-15 log-injection hardening
 // at the tracker's skip-log call site: when a write-back is skipped because the
-// target resolves to no eligible Application, the skip log includes the
+// termination carries no resolved target, the skip log includes the
 // termination's instance id. That id originates outside this package, so an
 // embedded newline must be escaped and must never forge an additional log line.
 // The tracker still returns nil (best-effort behavior is unchanged).
 func TestTrack_SanitizesInstanceIDInSkipLog(t *testing.T) {
-	// otherAppJSON is an Application that does NOT manage the target, and the
-	// allow-list is ["other"], so resolveGoverningApplication returns an error
-	// and Track logs the skip with the instance id (the sanitized call site).
-	srv := newServer(http.StatusOK, otherAppJSON, http.StatusOK, nil)
+	// An enabled tracker (non-nil client) whose termination carries an EMPTY
+	// target takes the no-target skip path, which logs the skip with the instance
+	// id (the sanitized call site). No network call is made on that path, so the
+	// server is never contacted.
+	srv := newServer(http.StatusOK, resolvableAppJSON, http.StatusOK, nil)
 	defer srv.Close()
 
-	tr, err := NewTracker(enabledMonkey(srv.URL, []string{"other"}))
+	tr, err := NewTracker(enabledMonkey(srv.URL, []string{"my-app"}))
 	if err != nil {
 		t.Fatalf("NewTracker returned error %v, want nil", err)
 	}
@@ -795,6 +795,7 @@ func TestTrack_SanitizesInstanceIDInSkipLog(t *testing.T) {
 	trm := chaosmonkey.Termination{
 		Instance: mock.Instance{App: "foo", Cluster: "my-app", InstanceID: "i-123\nFAKE forged log line"},
 		Time:     fixedTerminationTime(),
+		// Target left empty to take the no-target skip path.
 	}
 	if err := tr.Track(trm); err != nil {
 		// Ensure the logger is restored even on a fatal assertion.

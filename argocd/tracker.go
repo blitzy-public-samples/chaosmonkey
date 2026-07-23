@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/Netflix/chaosmonkey/v2"
@@ -69,9 +70,10 @@ const annotationPhasePreExecution = "pre-execution"
 // consume the existing termination store or wire the optional Argo CD
 // Notifications controller (AAP 0.2.2).
 //
-// The chaosmonkey.Termination type carries no termination identifier (only
-// Instance, Time, and Leashed), so the instance id doubles as the human-readable
-// subject of the record; no termination-id field is fabricated.
+// The chaosmonkey.Termination type carries no termination identifier (its fields
+// are Instance, Time, Leashed, and the gate-resolved Target — the governing
+// Application name, not a termination id), so the instance id doubles as the
+// human-readable subject of the record; no termination-id field is fabricated.
 type terminationAnnotation struct {
 	Instance string `json:"instance"`
 	Time     string `json:"time"`
@@ -100,9 +102,9 @@ const maxWriteBackTimeout = 5 * time.Second
 // writeBackBudget returns the deadline for one best-effort write-back: the
 // smaller of the configured Argo CD timeout and maxWriteBackTimeout. A
 // non-positive configured value (which the config layer defaults away) falls
-// back to the cap. This keeps the annotation PATCH — target-resolution GETs plus
-// the PATCH — from stalling the terminate run for the full configured timeout.
-// (Added for the Argo CD integration per code review M-01.)
+// back to the cap. This keeps the annotation PATCH from stalling the terminate
+// run for the full configured timeout. (Added for the Argo CD integration per
+// code review M-01.)
 func writeBackBudget(configured time.Duration) time.Duration {
 	if configured <= 0 || configured > maxWriteBackTimeout {
 		return maxWriteBackTimeout
@@ -150,10 +152,11 @@ func NewTracker(cfg *config.Monkey) (chaosmonkey.Tracker, error) {
 }
 
 // Track records the termination as a best-effort annotation on the governing
-// Argo CD Application. It ALWAYS returns nil: every failure mode (no client,
-// missing/typed-nil instance, unresolved Application, marshal error, HTTP error)
-// is logged and swallowed so that a write-back problem can never block or fail a
-// termination.
+// Argo CD Application named by Termination.Target (the identity the sync/health
+// gate resolved and authorized). It ALWAYS returns nil: every failure mode (no
+// client, missing/typed-nil instance, no carried target, ineligible target,
+// marshal error, HTTP error) is logged and swallowed so that a write-back
+// problem can never block or fail a termination.
 //
 // This is the mirror image of the precheck's fail-closed posture: the gate
 // denies on uncertainty, whereas the tracker never surfaces an error because
@@ -174,35 +177,49 @@ func (t argoTracker) Track(trm chaosmonkey.Termination) error {
 		return nil
 	}
 
-	// Bound the whole write-back (target-resolution GETs plus the annotation
-	// PATCH) by the write-back budget — the smaller of argocd.timeout and
-	// maxWriteBackTimeout — so a slow or hung Argo CD API on the pre-kill path
-	// can never stall the terminate run for the full configured timeout (M-01).
-	ctx, cancel := context.WithTimeout(context.Background(), writeBackBudget(t.timeout))
-	defer cancel()
-
-	// C-04: resolve the governing Application with the SAME shared, fail-closed
-	// resolver the sync/health gate uses (Mapper.resolveGoverningApplication), so
-	// the annotation can never land on a different Application than the gate
-	// evaluated. The tracker has no InstanceGroup in scope, so it resolves by
-	// instance only (nil group); a narrower identifier set can only ever resolve
-	// to the same Application the gate matched or to none — a broader match would
-	// have made the gate's resolution ambiguous and therefore denied the
-	// termination. Any ambiguity, unprovable uniqueness, lookup error, or no
-	// match is returned as an error, which the best-effort tracker logs and
-	// swallows (skip write-back), never surfacing it as a termination failure.
-	resolved, err := t.mapper.resolveGoverningApplication(ctx, t.client, nil, trm.Instance)
-	if err != nil {
-		// trm.Instance.ID() identifies the termination target and originates
-		// outside this package; printed with %s it is a log-injection vector, so
-		// sanitize it (strip/escape control characters, cap length). err is
-		// composed of package-local, operator-config-derived text (%q-quoted) and
-		// needs no sanitizing. (Log-injection hardening added per code review
-		// Q-15.)
-		log.Printf("argocd tracker: %v; skipping write-back for instance %s", err, sanitizeForLog(trm.Instance.ID()))
+	// F3/F4/F5 — annotate exactly the Application the sync/health gate authorized.
+	// term.doTerminate carries the gate-resolved governing Application name
+	// forward on Termination.Target, so the tracker writes back to that identity
+	// directly instead of independently re-resolving ownership. This:
+	//   - eliminates the redundant resolution GET, so a healthy termination's
+	//     Argo CD traffic is [gate GET, checker, PATCH, killer] (F4);
+	//   - guarantees a target the gate resolved via its instance group still
+	//     receives its write-back, even though Track has no InstanceGroup in
+	//     scope and instance-only re-resolution would have failed to match (F3);
+	//   - makes an ownership change between the gate and the write-back unable to
+	//     redirect the annotation to a DIFFERENT Application, because the target
+	//     is fixed at gate time rather than re-resolved here (F5 — TOCTOU).
+	// (Reworked for the Argo CD integration per QA findings F3/F4/F5; replaces the
+	// previous C-04 instance-only re-resolution.)
+	name := strings.TrimSpace(trm.Target)
+	if name == "" {
+		// No gate-resolved target to write back to: the sync/health gate either
+		// did not run or resolved nothing (e.g. the allow-all provider when the
+		// feature is disabled). Best-effort: skip without error. trm.Instance.ID()
+		// originates outside this package and is printed with %s, so sanitize it
+		// (strip/escape control characters, cap length) to prevent log injection
+		// (Q-15).
+		log.Printf("argocd tracker: termination carries no resolved argocd target; skipping write-back for instance %s", sanitizeForLog(trm.Instance.ID()))
 		return nil
 	}
-	name := resolved.Name()
+
+	// Defense-in-depth: only ever annotate an operator-configured eligible
+	// Application. The carried target already came from the gate resolving against
+	// this same eligible allow-list, so this is belt-and-suspenders — it ensures a
+	// malformed or unexpected Target can never cause a write to an unlisted
+	// Application. name is printed with %q, which escapes control characters.
+	if t.mapper != nil && !t.mapper.IsEligible(name) {
+		log.Printf("argocd tracker: resolved target %q is not an eligible application; skipping write-back", name)
+		return nil
+	}
+
+	// Bound the annotation PATCH by the write-back budget — the smaller of
+	// argocd.timeout and maxWriteBackTimeout — so a slow or hung Argo CD API on
+	// the pre-kill path can never stall the terminate run for the full configured
+	// timeout (M-01). No target-resolution GET is issued here; the target was
+	// already resolved by the gate and carried forward on the Termination.
+	ctx, cancel := context.WithTimeout(context.Background(), writeBackBudget(t.timeout))
+	defer cancel()
 
 	payload, err := json.Marshal(terminationAnnotation{
 		Instance: trm.Instance.ID(),

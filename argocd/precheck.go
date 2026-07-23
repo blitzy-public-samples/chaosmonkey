@@ -39,9 +39,10 @@ func init() {
 type allowAllPrecheck struct{}
 
 // Allow always permits the termination. Because it never errors, a disabled or
-// unconfigured Argo CD integration is completely inert.
-func (allowAllPrecheck) Allow(group grp.InstanceGroup, instance chaosmonkey.Instance) (bool, string, error) {
-	return true, "", nil
+// unconfigured Argo CD integration is completely inert. It resolves no target
+// (empty string), so a downstream tracker has nothing to write back to.
+func (allowAllPrecheck) Allow(group grp.InstanceGroup, instance chaosmonkey.Instance) (bool, string, string, error) {
+	return true, "", "", nil
 }
 
 // argoPrecheck is the Argo CD-backed pre-flight gate. It resolves the governing
@@ -115,10 +116,16 @@ func GetPrecheck(cfg *config.Monkey) (chaosmonkey.Precheck, error) {
 // one eligible Application manages the target (ambiguous ownership), when a
 // unique match cannot be proven because some eligible Application could not be
 // evaluated, and when a lookup fails or no eligible Application manages the
-// target. Using the same resolver as the write-back tracker guarantees the gate
-// and the annotation can never disagree about which Application a target belongs
-// to (code review C-03/C-04).
-func (p *argoPrecheck) Allow(group grp.InstanceGroup, instance chaosmonkey.Instance) (bool, string, error) {
+// target.
+//
+// On allow, the resolved Application name is returned as the target so the
+// caller can carry it (via Termination.Target) into the write-back tracker.
+// The tracker annotates exactly this gate-authorized identity rather than
+// re-resolving ownership itself, which guarantees the gate and the annotation
+// can never disagree about which Application a target belongs to — even if
+// ownership changes between the gate and the write-back (code review C-03/C-04;
+// QA findings F3/F4/F5).
+func (p *argoPrecheck) Allow(group grp.InstanceGroup, instance chaosmonkey.Instance) (bool, string, string, error) {
 	// Defensive nil guards: a malformed provider must fail closed (skip) rather
 	// than panic and crash the scheduler. In normal operation GetPrecheck always
 	// populates these fields, but a nil receiver, client, or mapper would
@@ -126,7 +133,7 @@ func (p *argoPrecheck) Allow(group grp.InstanceGroup, instance chaosmonkey.Insta
 	// short-circuit order makes the nil-receiver check safe. (Nil-safety
 	// hardening added per code review Q-09.)
 	if p == nil || p.client == nil || p.mapper == nil {
-		return false, "argocd: precheck provider is not fully initialized", nil
+		return false, "argocd: precheck provider is not fully initialized", "", nil
 	}
 
 	// A single deadline bounds the whole gate evaluation so a slow or
@@ -140,7 +147,7 @@ func (p *argoPrecheck) Allow(group grp.InstanceGroup, instance chaosmonkey.Insta
 	// resolver's descriptive reason and a nil error (fail-closed).
 	resolved, err := p.mapper.resolveGoverningApplication(ctx, p.client, group, instance)
 	if err != nil {
-		return false, err.Error(), nil
+		return false, err.Error(), "", nil
 	}
 
 	governing := resolved.Application()
@@ -149,12 +156,14 @@ func (p *argoPrecheck) Allow(group grp.InstanceGroup, instance chaosmonkey.Insta
 	// Defense-in-depth: a successful resolution already implies at least one
 	// live workload, but re-check so any future divergence still fails closed.
 	if !governing.HasLiveResources() {
-		return false, fmt.Sprintf("argocd: application %q manages no live resources", govName), nil
+		return false, fmt.Sprintf("argocd: application %q manages no live resources", govName), "", nil
 	}
 
 	// The only allow path: the governing Application is both Synced and Healthy.
+	// Return govName as the resolved target so the write-back tracker annotates
+	// exactly this Application (carried via Termination.Target).
 	if governing.IsSynced() && governing.IsHealthy() {
-		return true, "", nil
+		return true, "", govName, nil
 	}
 
 	// Fail-closed: the Application is not eligible for chaos right now. Name both
@@ -173,5 +182,5 @@ func (p *argoPrecheck) Allow(group grp.InstanceGroup, instance chaosmonkey.Insta
 		govName,
 		sanitizeForLog(governing.Status.Sync.Status),
 		sanitizeForLog(governing.Status.Health.Status),
-	), nil
+	), "", nil
 }
