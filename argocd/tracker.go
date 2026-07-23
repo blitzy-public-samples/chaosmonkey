@@ -193,7 +193,13 @@ func (t argoTracker) Track(trm chaosmonkey.Termination) error {
 	// swallows (skip write-back), never surfacing it as a termination failure.
 	resolved, err := t.mapper.resolveGoverningApplication(ctx, t.client, nil, trm.Instance)
 	if err != nil {
-		log.Printf("argocd tracker: %v; skipping write-back for instance %s", err, trm.Instance.ID())
+		// trm.Instance.ID() identifies the termination target and originates
+		// outside this package; printed with %s it is a log-injection vector, so
+		// sanitize it (strip/escape control characters, cap length). err is
+		// composed of package-local, operator-config-derived text (%q-quoted) and
+		// needs no sanitizing. (Log-injection hardening added per code review
+		// Q-15.)
+		log.Printf("argocd tracker: %v; skipping write-back for instance %s", err, sanitizeForLog(trm.Instance.ID()))
 		return nil
 	}
 	name := resolved.Name()

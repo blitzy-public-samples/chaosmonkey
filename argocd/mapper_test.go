@@ -26,8 +26,9 @@ package argocd
 //   - nil/typed-nil/ambiguous/ineligible/non-live inputs all deny without panic.
 //
 // The tests use only the standard-library testing package with a table-driven
-// style, matching the rest of the repository's test suite (testify is not used
-// anywhere in the module).
+// style, matching every other test in this module (no test file imports testify;
+// it is an indirect-only go.mod entry whose direct use would force a
+// go.mod/go.sum change the minimal-change contract forbids).
 
 import (
 	"context"

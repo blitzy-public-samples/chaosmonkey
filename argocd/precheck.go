@@ -67,6 +67,15 @@ var (
 // genuine misconfiguration (enabled but missing endpoint / bad TLS material);
 // the gate itself is fail-closed at call time.
 func GetPrecheck(cfg *config.Monkey) (chaosmonkey.Precheck, error) {
+	// Guard against a nil configuration so the DI factory never panics before it
+	// can dereference cfg (cfg.ArgoCDEnabled below). A nil *config.Monkey is a
+	// wiring/programming error at the injection layer rather than a user setting,
+	// so surface it explicitly instead of silently going inert. (Nil-safety
+	// hardening added per code review Q-09.)
+	if cfg == nil {
+		return nil, errors.New("argocd: GetPrecheck received a nil configuration")
+	}
+
 	// Disabled short-circuit: return the inert allow-all provider so existing
 	// behavior is preserved byte-for-byte when [argocd] is absent or disabled.
 	if !cfg.ArgoCDEnabled() {
@@ -110,6 +119,16 @@ func GetPrecheck(cfg *config.Monkey) (chaosmonkey.Precheck, error) {
 // and the annotation can never disagree about which Application a target belongs
 // to (code review C-03/C-04).
 func (p *argoPrecheck) Allow(group grp.InstanceGroup, instance chaosmonkey.Instance) (bool, string, error) {
+	// Defensive nil guards: a malformed provider must fail closed (skip) rather
+	// than panic and crash the scheduler. In normal operation GetPrecheck always
+	// populates these fields, but a nil receiver, client, or mapper would
+	// otherwise dereference-panic below (p.timeout / p.mapper / p.client). The
+	// short-circuit order makes the nil-receiver check safe. (Nil-safety
+	// hardening added per code review Q-09.)
+	if p == nil || p.client == nil || p.mapper == nil {
+		return false, "argocd: precheck provider is not fully initialized", nil
+	}
+
 	// A single deadline bounds the whole gate evaluation so a slow or
 	// unreachable Argo CD API can never stall the scheduler indefinitely.
 	ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
@@ -141,8 +160,18 @@ func (p *argoPrecheck) Allow(group grp.InstanceGroup, instance chaosmonkey.Insta
 	// Fail-closed: the Application is not eligible for chaos right now. Name both
 	// the sync and health status so Progressing/OutOfSync/Degraded/Suspended/
 	// Missing/Unknown are all visible in the scheduler logs.
+	//
+	// The sync/health status strings come verbatim from the Argo CD API response
+	// and are printed with %s, so sanitize them to strip/escape control
+	// characters and cap their length. This prevents a hostile or malformed
+	// status value from injecting newlines or forged entries into the scheduler
+	// log. (govName is the trusted, operator-configured name printed with %q,
+	// which already escapes control characters, so it is left as-is.)
+	// (Log-injection hardening added per code review Q-15.)
 	return false, fmt.Sprintf(
 		"argocd: application %q not eligible (sync=%s, health=%s)",
-		govName, governing.Status.Sync.Status, governing.Status.Health.Status,
+		govName,
+		sanitizeForLog(governing.Status.Sync.Status),
+		sanitizeForLog(governing.Status.Health.Status),
 	), nil
 }

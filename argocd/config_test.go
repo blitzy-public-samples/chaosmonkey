@@ -18,14 +18,18 @@ package argocd
 // backward-compatibility safety fixes: disabled inertness (no file I/O), token
 // trimming and empty-credential rejection when enabled, token-file precedence,
 // bounded timeout conversion, Application normalization, and token redaction in
-// formatted output. They use only the standard-library testing package (testify
-// is not used anywhere in the module).
+// formatted output. They use only the standard-library testing package, matching
+// every other test in this module (no test file imports testify; it is an
+// indirect-only go.mod entry whose direct use would force a go.mod/go.sum change
+// the minimal-change contract forbids).
 
 import (
 	"fmt"
 	"io/ioutil"
+	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -292,5 +296,107 @@ func TestConfig_StringRedactsToken(t *testing.T) {
 	// The accessor still returns the real token for same-package consumers.
 	if c.BearerToken() != secret {
 		t.Errorf("BearerToken() = %q, want %q", c.BearerToken(), secret)
+	}
+}
+
+// TestReadFileLimited_RejectsNonRegularFile verifies the Q-10 fail-closed file
+// policy: a FIFO (a non-regular file whose blocking read could otherwise hang
+// startup) is rejected with a descriptive error rather than hanging or being
+// read. Opening with O_NONBLOCK ensures the open returns immediately; the
+// opened-descriptor stat then rejects the non-regular target.
+func TestReadFileLimited_RejectsNonRegularFile(t *testing.T) {
+	fifo := filepath.Join(t.TempDir(), "argocd-token-fifo")
+	if err := syscall.Mkfifo(fifo, 0600); err != nil {
+		t.Skipf("cannot create FIFO on this platform: %v", err)
+	}
+
+	_, err := readFileLimited(fifo, maxTokenFileBytes)
+	if err == nil {
+		t.Fatal("readFileLimited(FIFO) error = nil, want a non-regular-file rejection")
+	}
+	if !strings.Contains(err.Error(), "regular file") {
+		t.Errorf("error = %q, want it to report that the file is not a regular file", err.Error())
+	}
+}
+
+// TestReadFileLimited_AcceptsSymlinkToRegularFile verifies that a regular file
+// reached through a symlink — the common Kubernetes Secret mount posture (the
+// ..data symlink) — is still read successfully, so the Q-10 hardening does not
+// break real deployments.
+func TestReadFileLimited_AcceptsSymlinkToRegularFile(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "real-token")
+	if err := ioutil.WriteFile(target, []byte("tok-xyz"), 0600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	link := filepath.Join(dir, "token-link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("cannot create symlink on this platform: %v", err)
+	}
+
+	data, err := readFileLimited(link, maxTokenFileBytes)
+	if err != nil {
+		t.Fatalf("readFileLimited(symlink->regular) error = %v, want nil", err)
+	}
+	if string(data) != "tok-xyz" {
+		t.Errorf("data = %q, want %q", string(data), "tok-xyz")
+	}
+}
+
+// TestConfigFromMonkey_NonRegularTokenFileRejected verifies the Q-10 policy end
+// to end through the public config path: an enabled integration whose token_file
+// is a FIFO fails closed with an error rather than hanging the terminate run.
+func TestConfigFromMonkey_NonRegularTokenFileRejected(t *testing.T) {
+	fifo := filepath.Join(t.TempDir(), "token-fifo")
+	if err := syscall.Mkfifo(fifo, 0600); err != nil {
+		t.Skipf("cannot create FIFO on this platform: %v", err)
+	}
+
+	m := config.Defaults()
+	m.Set(param.ArgoCDEnabled, true)
+	m.Set(param.ArgoCDEndpoint, "https://argocd.example.com")
+	m.Set(param.ArgoCDTokenFile, fifo)
+
+	if _, err := configFromMonkey(m); err == nil {
+		t.Error("configFromMonkey with a FIFO token_file error = nil, want a non-regular-file rejection")
+	}
+}
+
+// TestSanitizeForLog verifies the Q-15 log-injection defense: control characters
+// (notably CR/LF that could forge additional log lines) are escaped into a
+// visible form, ordinary printable text is returned unchanged (so existing
+// status/name/id log output and the reason-substring assertions that depend on
+// it are preserved), and an oversized value is capped.
+func TestSanitizeForLog(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain status unchanged", "OutOfSync", "OutOfSync"},
+		{"app name unchanged", "my-app-123", "my-app-123"},
+		{"newline escaped", "line1\nnot terminating: FORGED", `line1\nnot terminating: FORGED`},
+		{"carriage return escaped", "a\rb", `a\rb`},
+		{"tab escaped", "a\tb", `a\tb`},
+		{"nul escaped", "a\x00b", `a\x00b`},
+		{"del escaped", "a\x7fb", `a\x7fb`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sanitizeForLog(tc.in); got != tc.want {
+				t.Errorf("sanitizeForLog(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+
+	// A value longer than the cap is truncated with a visible marker and never
+	// grows unbounded.
+	long := strings.Repeat("x", maxLogFieldRunes+50)
+	got := sanitizeForLog(long)
+	if !strings.HasSuffix(got, "...(truncated)") {
+		t.Error("oversized value was not truncated with the expected marker")
+	}
+	if len([]rune(got)) > maxLogFieldRunes+len("...(truncated)") {
+		t.Errorf("truncated value too long: %d runes", len([]rune(got)))
 	}
 }

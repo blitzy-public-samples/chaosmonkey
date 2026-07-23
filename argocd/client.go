@@ -107,7 +107,23 @@ func NewClient(c Config) (*Client, error) {
 		tlsConfig.InsecureSkipVerify = true
 	}
 
-	transport := &http.Transport{TLSClientConfig: tlsConfig}
+	// Clone the standard-library default transport so the client keeps its
+	// production defaults — proxy selection from the environment
+	// (HTTP(S)_PROXY / NO_PROXY via http.ProxyFromEnvironment), connection dial
+	// timeouts, keep-alives, and idle-connection tuning — instead of a bare
+	// zero-value transport that silently drops all of them and would fail closed
+	// behind an enterprise egress proxy. Only the TLS configuration is
+	// overridden. (Transport hardening added per code review Q-11.)
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = tlsConfig
+	// Keep HTTP/2 disabled on this client. The integration performs only simple
+	// GET/PATCH calls for which HTTP/1.1 is sufficient, and disabling HTTP/2
+	// keeps the client off the HTTP/2-specific TLS attack surface flagged for the
+	// pinned runtime (code review Q-11 / Q-17) without requiring a toolchain
+	// change. A non-nil, empty TLSNextProto disables the HTTP/2 upgrade even
+	// though a custom TLSClientConfig is set.
+	transport.ForceAttemptHTTP2 = false
+	transport.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
 	httpClient := &http.Client{
 		Transport: transport,
 		Timeout:   c.Timeout,
@@ -149,11 +165,31 @@ func validateEndpoint(raw string) error {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return errors.Errorf("argocd: endpoint %q must use http or https", raw)
 	}
+	// Reject an opaque URL (e.g. "https:foo") before the host check so it yields
+	// a precise diagnostic. An opaque URL has no authority component, so joining
+	// it with the REST path would produce a nonsensical request target.
+	// (Endpoint hardening added per code review Q-14.)
+	if u.Opaque != "" {
+		return errors.Errorf("argocd: endpoint %q must be a normal absolute URL, not an opaque one", raw)
+	}
 	if u.Host == "" {
 		return errors.Errorf("argocd: endpoint %q is missing a host", raw)
 	}
 	if u.User != nil {
 		return errors.New("argocd: endpoint must not embed credentials (userinfo)")
+	}
+	// Reject a query string or a fragment. The endpoint is string-joined with the
+	// REST path (.../api/v1/applications/{name}); a query or fragment carried on
+	// the base URL would corrupt every constructed request target (and query
+	// content could leak into logs), so it is rejected up front. A normal path is
+	// intentionally still allowed so a base-path deployment (e.g. behind an
+	// ingress at https://host/argocd) continues to work with the existing path
+	// concatenation. (Endpoint hardening added per code review Q-14.)
+	if u.RawQuery != "" || u.ForceQuery {
+		return errors.Errorf("argocd: endpoint %q must not contain a query string", raw)
+	}
+	if u.Fragment != "" {
+		return errors.Errorf("argocd: endpoint %q must not contain a URL fragment", raw)
 	}
 	if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
 		return errors.Errorf("argocd: endpoint %q must use https (plain http is allowed only for loopback hosts)", raw)

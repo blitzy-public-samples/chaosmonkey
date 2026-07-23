@@ -32,6 +32,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/pkg/errors"
@@ -62,8 +63,8 @@ const (
 	defaultTimeoutSeconds = 30
 	// maxTimeoutSeconds bounds argocd.timeout so converting to a time.Duration
 	// (multiplying by time.Second) cannot overflow int64 into a non-positive,
-	// deadline-disabling value. One hour is far beyond any reasonable per-request
-	// Argo CD API timeout. (Overflow bound added per code review m-02.)
+	// deadline-disabling value. One hour is far beyond any reasonable
+	// single-operation Argo CD API timeout. (Overflow bound added per code review m-02.)
 	maxTimeoutSeconds = 3600
 	// maxTokenFileBytes bounds the token_file read. A bearer JWT / project-role
 	// token is far smaller than this; the cap prevents an oversized or
@@ -100,6 +101,44 @@ func redactedToken(s string) string {
 	return `"<redacted>"`
 }
 
+// maxLogFieldRunes caps the length of a single externally-influenced value
+// embedded in a log line, so an oversized value cannot flood the scheduler log.
+const maxLogFieldRunes = 256
+
+// sanitizeForLog makes an externally-influenced string safe to embed in a single
+// log line. Argo CD status strings, Application names, and instance identifiers
+// can in principle contain newlines or other control characters; interpolating
+// them raw would let a crafted value forge additional, misleading log entries
+// (log injection, CWE-117). sanitizeForLog escapes CR/LF/TAB and any other
+// control character (below 0x20, or DEL) into a visible \xNN form and caps the
+// result length. It is the identity function for ordinary printable text, so it
+// does not alter normal status/name/id output already relied upon by callers and
+// tests. (Added for the Argo CD integration per code review Q-15.)
+func sanitizeForLog(s string) string {
+	var b strings.Builder
+	n := 0
+	for _, r := range s {
+		if n >= maxLogFieldRunes {
+			b.WriteString("...(truncated)")
+			break
+		}
+		switch {
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r == '\t':
+			b.WriteString(`\t`)
+		case r < 0x20 || r == 0x7f:
+			fmt.Fprintf(&b, `\x%02x`, r)
+		default:
+			b.WriteRune(r)
+		}
+		n++
+	}
+	return b.String()
+}
+
 // readFileLimited reads at most max bytes from the file at path and returns an
 // explicit overflow error if the file is larger, so an oversized or adversarial
 // file fails closed instead of exhausting memory. It is shared by NewClient (CA
@@ -107,7 +146,13 @@ func redactedToken(s string) string {
 // same named-return pattern used elsewhere in the repository so a close error is
 // not silently discarded. (Bounded read added per code review M-04.)
 func readFileLimited(path string, max int64) (data []byte, err error) {
-	f, err := os.Open(path)
+	// Open with O_NONBLOCK so the open itself cannot block on a FIFO/device whose
+	// reader side would otherwise wait indefinitely for a writer. A misconfigured
+	// or adversarial token/CA path must fail fast rather than hang the terminate
+	// run before any HTTP deadline can apply (code review Q-10). O_NONBLOCK has no
+	// effect on the subsequent reads of a regular file, which is all this
+	// function ever proceeds to read.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -116,6 +161,22 @@ func readFileLimited(path string, max int64) (data []byte, err error) {
 			err = errors.Wrapf(cerr, "argocd: closing %q", path)
 		}
 	}()
+
+	// Validate the OPENED descriptor before reading (code review Q-10). Stat the
+	// handle we actually hold — not a pre-open Lstat, which would be a TOCTOU
+	// race between the check and the read — and reject anything that is not a
+	// regular file. This fails closed on a FIFO/device/socket (which O_NONBLOCK
+	// let us open without hanging) while still accepting a regular file reached
+	// through a symlink (e.g. a Kubernetes Secret mounted via the ..data
+	// symlink), which is the common, supported production posture for the token
+	// and CA files.
+	info, err := f.Stat()
+	if err != nil {
+		return nil, errors.Wrapf(err, "argocd: could not stat %q", path)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.Errorf("argocd: %q is not a regular file (mode %s); refusing to read a non-regular credential/CA file", path, info.Mode())
+	}
 
 	// Read one byte beyond the cap so an exactly-at-limit file is accepted while
 	// anything larger is detected and rejected.
@@ -129,29 +190,31 @@ func readFileLimited(path string, max int64) (data []byte, err error) {
 	return data, nil
 }
 
-// warnIfTokenFileInsecure emits a best-effort, non-fatal warning when the token
-// file is a symlink, is not a regular file, or is group/world-accessible, so an
-// operator is alerted to a credential-exposure risk without breaking a working
-// deployment. The policy is advisory (logged, not enforced) because the token
-// file's ownership/permission model is deployment-specific; the recommended and
-// documented posture is a regular, owner-only (0600) file. (Added per code
-// review m-02; documented in docs/plugins/ArgoCD.md.)
+// warnIfTokenFileInsecure emits a best-effort, non-fatal warning when the
+// resolved token file is group/world-accessible, so an operator is alerted to a
+// credential-exposure risk without breaking a working deployment. The policy is
+// advisory (logged, not enforced) because the token file's ownership/permission
+// model is deployment-specific — for example a Kubernetes Secret is commonly
+// mounted world-readable inside the container — and the recommended, documented
+// posture is an owner-only (0600) file.
+//
+// It uses Stat (following a symlink to its target) so the check reflects the
+// file that will actually be read; a symlink to a regular file (e.g. a
+// Kubernetes Secret mounted through the ..data symlink) is a normal, supported
+// posture and is intentionally NOT flagged as suspicious here. A genuinely
+// non-regular target (FIFO/device/socket) is separately and firmly rejected by
+// readFileLimited, which validates the opened descriptor. (Refined per code
+// review Q-10; originally added per code review m-02; documented in
+// docs/plugins/ArgoCD.md.)
 func warnIfTokenFileInsecure(path string) {
-	// Lstat (not Stat) so a symlink is reported as a symlink rather than its
-	// target, letting us flag the indirection explicitly.
-	info, err := os.Lstat(path)
+	info, err := os.Stat(path)
 	if err != nil {
 		// A stat error here is not authoritative; the subsequent bounded read
 		// surfaces any genuine read failure as a wrapped error.
 		return
 	}
 	mode := info.Mode()
-	switch {
-	case mode&os.ModeSymlink != 0:
-		log.Printf("argocd: WARNING: token_file %q is a symlink; ensure its target is a regular, owner-only (0600) file", path)
-	case !mode.IsRegular():
-		log.Printf("argocd: WARNING: token_file %q is not a regular file; a regular, owner-only (0600) file is recommended", path)
-	case mode.Perm()&0o077 != 0:
+	if mode.IsRegular() && mode.Perm()&0o077 != 0 {
 		log.Printf("argocd: WARNING: token_file %q is group/world-accessible (mode %#o); restrict it to owner-only (0600)", path, mode.Perm())
 	}
 }

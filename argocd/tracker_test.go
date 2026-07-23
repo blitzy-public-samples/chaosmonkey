@@ -27,13 +27,13 @@ package argocd
 // the Argo CD timeline (User Example Flow 2).
 //
 // Framework: these tests use ONLY the standard-library testing and
-// net/http/httptest packages, matching every other test in this module. testify
-// is not imported anywhere in the repository; it appears in go.mod solely as an
-// // indirect requirement, so importing it directly here would promote it to a
-// direct dependency under `go mod tidy` and change go.mod — which the feature's
-// minimal-change contract forbids. Plain testing is therefore the required
-// choice (the plan's explicit fallback when testify would force a go.mod/go.sum
-// change).
+// net/http/httptest packages, matching every other test in this module (no test
+// file imports testify). testify v1.8.1 appears in go.mod solely as an indirect
+// requirement, and its own required modules (e.g. pmezard/go-difflib,
+// gopkg.in/yaml.v3) are absent, so importing it directly would make `go mod tidy`
+// add those modules and promote testify to a direct require — a go.mod/go.sum
+// change the feature's minimal-change contract forbids. Plain stdlib testing is
+// therefore the required choice.
 //
 // Adaptation note: the delivered target-resolution engine (mapper.go) is
 // fail-closed and binds ownership to an Application's authoritative
@@ -45,7 +45,9 @@ package argocd
 // write-back is exercised end-to-end through the public NewTracker constructor.
 
 import (
+	"bytes"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -757,5 +759,57 @@ func TestTrack_SlowServer_BoundedReturnsNil(t *testing.T) {
 		}
 	case <-time.After(stall):
 		t.Fatalf("Track did not return within the %v server stall; the write-back budget did not bound it", stall)
+	}
+}
+
+// TestTrack_SanitizesInstanceIDInSkipLog proves the Q-15 log-injection hardening
+// at the tracker's skip-log call site: when a write-back is skipped because the
+// target resolves to no eligible Application, the skip log includes the
+// termination's instance id. That id originates outside this package, so an
+// embedded newline must be escaped and must never forge an additional log line.
+// The tracker still returns nil (best-effort behavior is unchanged).
+func TestTrack_SanitizesInstanceIDInSkipLog(t *testing.T) {
+	// otherAppJSON is an Application that does NOT manage the target, and the
+	// allow-list is ["other"], so resolveGoverningApplication returns an error
+	// and Track logs the skip with the instance id (the sanitized call site).
+	srv := newServer(http.StatusOK, otherAppJSON, http.StatusOK, nil)
+	defer srv.Close()
+
+	tr, err := NewTracker(enabledMonkey(srv.URL, []string{"other"}))
+	if err != nil {
+		t.Fatalf("NewTracker returned error %v, want nil", err)
+	}
+
+	// Capture the standard logger's output for the duration of this call, with
+	// no timestamp prefix so the assertions inspect only the message text.
+	var buf bytes.Buffer
+	prevOut := log.Writer()
+	prevFlags := log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	}()
+
+	trm := chaosmonkey.Termination{
+		Instance: mock.Instance{App: "foo", Cluster: "my-app", InstanceID: "i-123\nFAKE forged log line"},
+		Time:     fixedTerminationTime(),
+	}
+	if err := tr.Track(trm); err != nil {
+		// Ensure the logger is restored even on a fatal assertion.
+		log.SetOutput(prevOut)
+		t.Fatalf("Track returned error %v, want nil (best-effort)", err)
+	}
+
+	out := buf.String()
+	// The embedded newline from the instance id must have been escaped: the raw
+	// two-line sequence must NOT appear (log adds only its own single trailing
+	// newline), but the escaped \n form must.
+	if strings.Contains(out, "i-123\nFAKE forged log line") {
+		t.Errorf("skip log contains a raw newline from the instance id (log-injection not prevented):\n%q", out)
+	}
+	if !strings.Contains(out, `i-123\nFAKE forged log line`) {
+		t.Errorf("skip log %q, want the instance id newline escaped as \\n", out)
 	}
 }

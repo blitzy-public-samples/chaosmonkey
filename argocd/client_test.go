@@ -35,8 +35,12 @@ package argocd
 //     oversized-response guard.
 //
 // The tests use only the standard-library testing package with a table-driven
-// style, matching the rest of the repository's test suite (testify is not used
-// anywhere in the module, and importing it would require a go.mod change).
+// style, matching every other test in this module (no test file imports
+// testify). testify v1.8.1 is listed in go.mod only as an indirect requirement
+// and its own required modules (e.g. pmezard/go-difflib, gopkg.in/yaml.v3) are
+// absent, so importing it directly would make `go mod tidy` add those modules
+// and promote testify to a direct require — a go.mod/go.sum change the
+// minimal-change contract (AAP 0.3.2) forbids.
 
 import (
 	"context"
@@ -395,6 +399,16 @@ func TestNewClientRejectsInsecureOrMalformedEndpoints(t *testing.T) {
 		{name: "https remote is allowed", endpoint: "https://argocd.example.com", wantErr: false},
 		{name: "plain http loopback is allowed", endpoint: "http://127.0.0.1:8080", wantErr: false},
 		{name: "plain http localhost is allowed", endpoint: "http://localhost:8080", wantErr: false},
+		// Q-14 endpoint hardening: a base URL carrying a query, a forced query,
+		// a fragment, or an opaque form would corrupt the string-joined REST
+		// path (.../api/v1/applications/{name}) and is rejected up front.
+		{name: "endpoint carries query string", endpoint: "https://argocd.example.com?foo=bar", wantErr: true},
+		{name: "endpoint carries forced query", endpoint: "https://argocd.example.com/?", wantErr: true},
+		{name: "endpoint carries fragment", endpoint: "https://argocd.example.com#frag", wantErr: true},
+		{name: "opaque url", endpoint: "https:argocd.example.com", wantErr: true},
+		// A normal base path is still accepted so a base-path deployment behind
+		// an ingress (e.g. https://host/argocd) keeps working.
+		{name: "https base path is allowed", endpoint: "https://argocd.example.com/argocd", wantErr: false},
 	}
 
 	for _, tc := range tests {
@@ -408,6 +422,59 @@ func TestNewClientRejectsInsecureOrMalformedEndpoints(t *testing.T) {
 				t.Errorf("NewClient(%q) error = %v, want nil", tc.endpoint, err)
 			}
 		})
+	}
+}
+
+// TestNewClientTransportPreservesProxyDefaults proves the Q-11 transport fix:
+// NewClient clones http.DefaultTransport rather than substituting a bare
+// zero-value &http.Transport{}. A bare transport would silently drop proxy
+// selection (Proxy == nil), the connection dialer, and idle-connection tuning,
+// which would break the client behind an enterprise egress proxy. The clone
+// must retain those defaults while overriding only TLS and keeping HTTP/2
+// disabled.
+func TestNewClientTransportPreservesProxyDefaults(t *testing.T) {
+	c, err := NewClient(Config{Endpoint: "https://argocd.example.com", token: "t", Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+
+	tr, ok := c.httpClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("client transport type = %T, want *http.Transport", c.httpClient.Transport)
+	}
+	def := http.DefaultTransport.(*http.Transport)
+
+	// Proxy selection from the environment must be preserved (a bare transport
+	// would leave this nil and ignore HTTP(S)_PROXY / NO_PROXY).
+	if tr.Proxy == nil {
+		t.Error("transport Proxy = nil, want the inherited http.ProxyFromEnvironment selector")
+	}
+	// The dialer and idle-connection tuning must match the cloned defaults.
+	if tr.DialContext == nil {
+		t.Error("transport DialContext = nil, want the inherited default dialer")
+	}
+	if tr.MaxIdleConns != def.MaxIdleConns {
+		t.Errorf("transport MaxIdleConns = %d, want cloned default %d", tr.MaxIdleConns, def.MaxIdleConns)
+	}
+	if tr.IdleConnTimeout != def.IdleConnTimeout {
+		t.Errorf("transport IdleConnTimeout = %v, want cloned default %v", tr.IdleConnTimeout, def.IdleConnTimeout)
+	}
+	if tr.TLSHandshakeTimeout != def.TLSHandshakeTimeout {
+		t.Errorf("transport TLSHandshakeTimeout = %v, want cloned default %v", tr.TLSHandshakeTimeout, def.TLSHandshakeTimeout)
+	}
+	// Only the TLS configuration is overridden.
+	if tr.TLSClientConfig == nil {
+		t.Error("transport TLSClientConfig = nil, want the client's configured *tls.Config")
+	}
+	// HTTP/2 must remain disabled: a non-nil, empty TLSNextProto prevents the
+	// automatic HTTP/2 upgrade even though a custom TLSClientConfig is set.
+	if tr.ForceAttemptHTTP2 {
+		t.Error("transport ForceAttemptHTTP2 = true, want false (HTTP/2 disabled)")
+	}
+	if tr.TLSNextProto == nil {
+		t.Error("transport TLSNextProto = nil, want a non-nil empty map disabling HTTP/2")
+	} else if len(tr.TLSNextProto) != 0 {
+		t.Errorf("transport TLSNextProto has %d entries, want 0 (HTTP/2 disabled)", len(tr.TLSNextProto))
 	}
 }
 

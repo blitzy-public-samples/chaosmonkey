@@ -401,10 +401,11 @@ func (m *Monkey) ArgoCDTokenFile() string { return m.v.GetString(param.ArgoCDTok
 func (m *Monkey) ArgoCDProject() string { return m.v.GetString(param.ArgoCDProject) }
 
 // ArgoCDApplications returns the list of chaos-eligible Argo CD Application
-// names. Each entry is an exact Application name (matched, after whitespace
-// trimming, against an Application's metadata.name); label-selector based
-// discovery via the Argo CD list API is a concern of the Argo CD client layer,
-// not this accessor. (Doc clarified for the Argo CD integration per code review M-02.)
+// names. Each entry is an EXACT Application name, matched (after whitespace
+// trimming) against an Application's metadata.name and fetched individually via
+// GET /api/v1/applications/{name}. Label-selector / list-based discovery is not
+// performed: the eligible set is exactly the names configured here. (Doc
+// clarified for the Argo CD integration per code review M-02/Q-16.)
 func (m *Monkey) ArgoCDApplications() ([]string, error) {
 	return m.getStringSlice(param.ArgoCDApplications)
 }
@@ -415,7 +416,14 @@ func (m *Monkey) ArgoCDInsecureSkipVerify() bool { return m.v.GetBool(param.Argo
 // ArgoCDCACert returns a path to a PEM CA bundle used to verify the Argo CD server certificate.
 func (m *Monkey) ArgoCDCACert() string { return m.v.GetString(param.ArgoCDCACert) }
 
-// ArgoCDTimeout returns the per-request timeout (in seconds) for Argo CD API calls.
+// ArgoCDTimeout returns the configured Argo CD API timeout in seconds (the raw
+// viper value). It is used as a whole-operation budget, not a strict
+// per-HTTP-request timeout: the sync/health gate applies it as a single deadline
+// bounding the entire gate evaluation (target resolution plus status read), and
+// the write-back tracker bounds one annotation write by the smaller of this
+// value and an internal 5s cap. The argocd config layer coerces the value to a
+// bound before use (non-positive -> 30s default; above 3600 -> 3600s). (Doc
+// clarified for the Argo CD integration per code review Q-16.)
 func (m *Monkey) ArgoCDTimeout() int { return m.v.GetInt(param.ArgoCDTimeout) }
 
 // Decryptor returns an interface for decrypting secrets

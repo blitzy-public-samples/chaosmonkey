@@ -37,12 +37,12 @@ To turn on the Argo CD integration:
 
 Like the other extension points, the Argo CD plugin registers itself through a Go
 `init()` function that wires the `deps.GetPrecheck` factory, matching the existing
-outage / tracker / constrainer registration pattern. That `init()` currently runs
-because the `tracker` package imports the `argocd` package, so building Chaos
-Monkey with the tracker factory pulls the precheck registration in transitively; a
-dedicated blank import in `cmd/chaosmonkey/main.go` is planned to make the
-registration explicit. The terminate command nil-guards the factory, so even
-without registration the gate simply degrades to allow-all rather than failing.
+outage / tracker / constrainer registration pattern. That `init()` runs in the
+shipped binary because `cmd/chaosmonkey/main.go` blank-imports the `argocd`
+package explicitly (and the `tracker` package also imports `argocd` for its
+`"argocd"` tracker case, so registration is assured regardless of import order).
+The terminate command nil-guards the factory, so even without registration the
+gate simply degrades to allow-all rather than failing.
 See the [Plugins](index.md) page for how to build a custom version of Chaos Monkey
 with plugins.
 
@@ -74,7 +74,11 @@ All configuration lives under the optional `[argocd]` section of
   Argo CD server.
 - `ca_cert` — path to a PEM CA bundle used to verify the Argo CD server
   certificate.
-- `timeout` — per-request timeout in seconds, default `30`.
+- `timeout` — Argo CD API timeout in seconds, default `30`. It is a
+  whole-operation budget (a single deadline over target resolution plus the
+  status read for the gate; a `min(timeout, 5s)` budget for one write-back), not
+  a strict per-HTTP-request timeout. Non-positive values fall back to `30`, and
+  values above `3600` are capped at `3600`.
 
 Example:
 
@@ -97,7 +101,9 @@ See the [Configuration File Format](../Configuration-file-format) page for the f
 
 The gate implements the
 [Precheck](https://pkg.go.dev/github.com/Netflix/chaosmonkey/v2#Precheck) interface
-and is evaluated immediately before a termination executes.
+and is evaluated in the termination path after a target instance has been selected
+and before the termination is carried out. It is evaluated once at that point (it
+is not re-checked at the final kill step).
 
 - It **allows** a termination only when the target correlates to a chaos-eligible
   `Application` (one whose exact name is listed in `argocd.applications`) that
@@ -155,8 +161,11 @@ The practical effects:
   direct operator control.
 - If the target correlates to more than one eligible `Application` (ambiguous
   ownership), or to none, the gate **fails closed** and skips.
-- Both the gate and the write-back use this **same** resolver, so the write-back
-  can never annotate an `Application` the gate did not evaluate.
+- Both the gate and the write-back use this **same** resolver logic, so the
+  write-back targets the same `Application` the gate evaluated. They resolve
+  independently (rather than sharing a single result object), so as
+  defense-in-depth the write-back also rejects a PATCH whose response names a
+  different `Application`.
 
 ## Write-back (event annotation)
 
@@ -191,9 +200,10 @@ tracker runs on the pre-kill path, the whole write-back — target-resolution re
 plus the annotation PATCH — is bounded by a short independent deadline (the
 smaller of `argocd.timeout` and an internal 5-second cap), so a slow or hung Argo
 CD API cannot stall a termination for the full configured timeout. The write-back
-resolves its target with the **same** strict, globally-unique resolver as the
-gate, so it can never annotate a different `Application` than the gate evaluated,
-and it rejects a PATCH whose response names a different `Application`.
+resolves its target with the **same** strict, globally-unique resolver logic as
+the gate, so it targets the same `Application` the gate evaluated, and as
+defense-in-depth it rejects a PATCH whose response names a different
+`Application`.
 
 ### ApplicationSet annotation preservation
 

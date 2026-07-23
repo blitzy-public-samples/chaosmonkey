@@ -98,7 +98,7 @@ project = ""                  # optional Argo CD project used to scope Applicati
 applications = []             # exact chaos-eligible Argo CD Application names (matched against Application metadata.name)
 insecure_skip_verify = false  # skip TLS verification to the Argo CD server
 ca_cert = ""                  # path to a PEM CA bundle to verify the Argo CD server cert
-timeout = 30                  # per-request timeout in seconds
+timeout = 30                  # Argo CD API timeout (seconds): whole-operation budget, not per-request; <=0 -> 30, capped at 3600
 
 # For dynamic configuration options, see viper docs
 [dynamic]

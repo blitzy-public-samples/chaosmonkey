@@ -34,12 +34,13 @@ package argocd
 // uncertain gate is a silent skip and never a crash or a propagated error.
 //
 // The tests use only the standard-library testing and net/http/httptest
-// packages with a table-driven style, matching the rest of the repository's
-// test suite (testify is not used anywhere in the module, and importing it
-// would promote an indirect dependency to a direct one, forcing a go.mod
-// change). Several helpers declared in the sibling test files of this same
-// package are reused: newServer and mustClient (tracker_test.go) and contains
-// (client_test.go).
+// packages with a table-driven style, matching every other test in this module
+// (no test file imports testify). testify v1.8.1 is an indirect-only go.mod
+// entry and its own required modules (e.g. pmezard/go-difflib, gopkg.in/yaml.v3)
+// are absent, so importing it directly would force `go mod tidy` to change
+// go.mod/go.sum — which the minimal-change contract (AAP 0.3.2) forbids. Several
+// helpers declared in the sibling test files of this same package are reused:
+// newServer and mustClient (tracker_test.go) and contains (client_test.go).
 
 import (
 	"net/http"
@@ -606,5 +607,83 @@ func TestAllow_SingleOwnerAmongMany_Allows(t *testing.T) {
 	}
 	if !allowed {
 		t.Errorf("Allow allowed = false, want true (unique owner among many eligible Applications); reason=%q", reason)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Nil-safety (code review Q-09) — the gate must never panic the scheduler.
+// -----------------------------------------------------------------------------
+
+// TestGetPrecheck_NilConfig_NoPanic proves the Q-09 factory guard: GetPrecheck
+// must not dereference a nil *config.Monkey (the previous code called
+// cfg.ArgoCDEnabled() before any nil check, which panicked). A nil config is a
+// wiring/programming error, so it is surfaced as a construction error rather
+// than a panic. The bare call would fail the test with a panic if the guard were
+// absent, so reaching the assertions at all is itself part of the proof.
+func TestGetPrecheck_NilConfig_NoPanic(t *testing.T) {
+	p, err := GetPrecheck(nil)
+	if err == nil {
+		t.Error("GetPrecheck(nil) error = nil, want a descriptive construction error")
+	}
+	if p != nil {
+		t.Errorf("GetPrecheck(nil) provider = %T, want nil on error", p)
+	}
+}
+
+// TestAllow_NilProviderFields_FailClosed proves the Q-09 defensive guards inside
+// Allow: a provider with a nil receiver, a nil client, or a nil mapper must fail
+// closed (graceful skip) instead of dereference-panicking mid-termination. Each
+// variant would otherwise crash the scheduler.
+func TestAllow_NilProviderFields_FailClosed(t *testing.T) {
+	tests := []struct {
+		name string
+		p    *argoPrecheck
+	}{
+		{name: "nil receiver", p: nil},
+		{name: "nil client", p: &argoPrecheck{mapper: NewMapper([]string{precheckApp}), timeout: time.Second}},
+		{name: "nil mapper", p: &argoPrecheck{client: mustClient(t, "https://localhost:8080", nil), timeout: time.Second}},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			allowed, reason, err := tc.p.Allow(nil, standardTarget())
+			assertGracefulSkip(t, allowed, reason, err)
+			if !contains(reason, "not fully initialized") {
+				t.Errorf("reason %q, want it to report the uninitialized provider", reason)
+			}
+		})
+	}
+}
+
+// TestAllow_SanitizesInjectedStatusInReason proves the Q-09/Q-15 log-injection
+// hardening: the sync/health status strings are copied verbatim from the (
+// attacker-influenceable) Argo CD API response and printed with %s, so a status
+// value carrying an embedded newline must not be able to forge a second line in
+// the scheduler log. The fixture serves a health status whose JSON escape decodes
+// to a real newline; the gate denies (not Healthy) and the resulting reason must
+// carry the status only in escaped form, never as a raw control character.
+func TestAllow_SanitizesInjectedStatusInReason(t *testing.T) {
+	// A raw-string literal: the two characters backslash+n form a JSON string
+	// escape on the wire, which decodes to a single real newline in the Go
+	// Health.Status field once the client parses the response.
+	const injected = `Degraded\nFAKE amazon terminated everything`
+	srv := appServer(t, http.StatusOK, SyncStatusSynced, injected, 1)
+	defer srv.Close()
+
+	p := newArgoPrecheck(t, srv)
+	allowed, reason, err := p.Allow(nil, standardTarget())
+	assertGracefulSkip(t, allowed, reason, err)
+
+	// The decoded newline must have been escaped away — no raw newline may reach
+	// the log line the reason becomes.
+	if contains(reason, "\n") {
+		t.Errorf("reason contains a raw newline (log-injection not prevented): %q", reason)
+	}
+	// ...but the (escaped) status text must still be present and readable.
+	if !contains(reason, "\\n") {
+		t.Errorf("reason %q, want the injected newline escaped as \\n", reason)
+	}
+	if !contains(reason, "FAKE amazon terminated everything") {
+		t.Errorf("reason %q, want it to still include the (escaped) status text", reason)
 	}
 }
