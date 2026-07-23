@@ -144,12 +144,38 @@ func doTerminate(d deps.Deps, group grp.InstanceGroup) error {
 
 	log.Printf("Picked: %s", instance)
 
+	// Argo CD integration: additive, nil-guarded pre-flight gate evaluated after
+	// the target instance is selected and before the min-time check. A nil
+	// provider means allow-all, so existing behavior is preserved when the
+	// feature is unconfigured. Fail-closed: a gate error or a denial results in
+	// NOT terminating (mirrors the outage-check safe path above).
+	//
+	// precheckTarget carries the opaque, gate-resolved target identity (for the
+	// Argo CD adapter, the governing Application name) forward onto the
+	// Termination so a downstream tracker writes back to exactly the identity
+	// this gate authorized, rather than independently re-resolving it. It stays
+	// empty when no Precheck provider is configured.
+	var precheckTarget string
+	if d.Precheck != nil {
+		allowed, reason, target, err := d.Precheck.Allow(group, instance)
+		if err != nil {
+			return errors.Wrap(err, "not terminating: argocd precheck failed")
+		}
+		if !allowed {
+			log.Printf("not terminating: %s", reason)
+			return nil
+		}
+		precheckTarget = target
+	}
+
 	loc, err := d.MonkeyCfg.Location()
 	if err != nil {
 		return errors.Wrap(err, "not terminating: could not retrieve location")
 	}
 
-	trm := chaosmonkey.Termination{Instance: instance, Time: d.Cl.Now(), Leashed: leashed}
+	// Argo CD integration: Target is set from the gate-resolved identity above
+	// so trackers annotate the authorized target without re-resolving it.
+	trm := chaosmonkey.Termination{Instance: instance, Time: d.Cl.Now(), Leashed: leashed, Target: precheckTarget}
 
 	//
 	// Check that we don't violate min time between terminations

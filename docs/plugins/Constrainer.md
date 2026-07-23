@@ -1,7 +1,7 @@
 # Constrainer
 
 There may be some cases where you want to prevent some combination of Chaos
-Monkey terminations, but the [configuration options](../Configuring-behavior-via-spinnaker) aren't flexible
+Monkey terminations, but the [configuration options](../Configuring-behavior-via-Spinnaker) aren't flexible
 enough for your use case.
 
 You can define a custom constrainer to do this.

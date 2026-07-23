@@ -18,6 +18,9 @@ package chaosmonkey
 import (
 	"fmt"
 	"time"
+
+	// Added for the Argo CD integration: the Precheck interface (below) uses grp.InstanceGroup.
+	"github.com/Netflix/chaosmonkey/v2/grp"
 )
 
 const (
@@ -92,6 +95,15 @@ type (
 		Instance Instance  // The instance that will be terminated
 		Time     time.Time // Termination time
 		Leashed  bool      // If true, track the termination but do not execute it
+		// Target is an opaque, provider-defined identifier for the resolved
+		// termination target, populated by the Precheck gate and carried
+		// forward to Trackers. Added for the Argo CD integration so the
+		// write-back tracker annotates exactly the governing Application that
+		// the pre-flight gate authorized (rather than independently
+		// re-resolving it, which could drift under ownership changes). It is
+		// empty when no Precheck resolved a target (e.g. the feature is
+		// unconfigured); trackers that do not understand it simply ignore it.
+		Target string
 	}
 
 	// Tracker records termination events an a tracking system such as Chronos
@@ -152,6 +164,35 @@ type (
 	Outage interface {
 		// Outage returns true if there is an ongoing outage
 		Outage() (bool, error)
+	}
+
+	// Precheck is an additive pre-flight gate that decides whether a
+	// termination may proceed for a given target. It is evaluated in addition
+	// to (never in place of) the existing safety controls (enabled/leashed,
+	// outage, account, exception/whitelist, min-time). A nil Precheck provider
+	// means allow-all, so existing behavior is preserved when the feature is
+	// unconfigured.
+	//
+	// Added for the Argo CD integration: unlike Outage(), Allow carries
+	// per-target context (the instance group and selected instance) so an
+	// adapter can look up the governing Argo CD Application and gate on its
+	// sync/health status. Implementations MUST fail closed: on any error the
+	// caller does not terminate.
+	Precheck interface {
+		// Allow reports whether the termination of instance (within group) may
+		// proceed. When allowed is false, reason explains why (for logging).
+		// A non-nil err indicates the gate could not be evaluated and the
+		// caller must treat this as "do not terminate" (fail-closed).
+		//
+		// target is an opaque, provider-defined identifier for the resolved
+		// termination target (for the Argo CD adapter, the name of the
+		// governing Application). It is carried into Termination.Target so a
+		// downstream Tracker writes back to exactly the identity this gate
+		// authorized, without independently re-resolving it. Implementations
+		// return an empty target when allowed is false or when they resolve no
+		// target (e.g. an allow-all provider); the value is only meaningful
+		// when allowed is true.
+		Allow(group grp.InstanceGroup, instance Instance) (allowed bool, reason string, target string, err error)
 	}
 
 	// ErrViolatesMinTime represents an error when trying to record a termination

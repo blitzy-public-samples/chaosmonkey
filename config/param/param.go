@@ -54,4 +54,15 @@ const (
 	DynamicProvider = "dynamic.provider"
 	DynamicEndpoint = "dynamic.endpoint"
 	DynamicPath     = "dynamic.path"
+
+	// argocd
+	ArgoCDEnabled            = "argocd.enabled"
+	ArgoCDEndpoint           = "argocd.endpoint"
+	ArgoCDToken              = "argocd.token"
+	ArgoCDTokenFile          = "argocd.token_file"
+	ArgoCDProject            = "argocd.project"
+	ArgoCDApplications       = "argocd.applications"
+	ArgoCDInsecureSkipVerify = "argocd.insecure_skip_verify"
+	ArgoCDCACert             = "argocd.ca_cert"
+	ArgoCDTimeout            = "argocd.timeout"
 )

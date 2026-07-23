@@ -89,6 +89,17 @@ certificate = ""        # path to p12 file when using client-side tls certs
 encrypted_password = "" # password used for p12 certificate, encrypted by decryptor
 user = ""               # user associated with terminations, sent in API call to terminate
 
+[argocd]
+enabled = false               # master switch for the Argo CD sync/health gate (write-back also needs trackers=["argocd"])
+endpoint = ""                 # Argo CD API server base URL, e.g. https://argocd.example.com
+token = ""                    # inline bearer token (JWT); prefer token_file in production
+token_file = ""               # path to a file containing the bearer token (takes precedence over token)
+project = ""                  # optional Argo CD project used to scope Application lookups
+applications = []             # exact chaos-eligible Argo CD Application names (matched against Application metadata.name)
+insecure_skip_verify = false  # skip TLS verification to the Argo CD server
+ca_cert = ""                  # path to a PEM CA bundle to verify the Argo CD server cert
+timeout = 30                  # Argo CD API timeout (seconds): whole-operation budget, not per-request; <=0 -> 30, capped at 3600
+
 # For dynamic configuration options, see viper docs
 [dynamic]
 provider = ""   # options: "etcd", "consul"
@@ -98,3 +109,23 @@ path = ""       # path for dynamic provider
 
 Note that many of these configuration parameters (decryptor, trackers,
 error_counter, outage_checker) currently only have no-op implementations.
+
+To enable the optional Argo CD integration, set `argocd.enabled = true` and
+configure the `[argocd]` section above. `argocd.enabled` is the master switch
+for the sync/health gate only; it does not by itself enable write-back. List the
+exact names of the chaos-eligible Argo CD `Application` resources in
+`argocd.applications` (an empty list makes no Application eligible, so the gate
+denies every experiment). When a termination target correlates to one of those
+Applications through a live managed workload in its `status.resources`, the gate
+permits the experiment only while that `Application` is both `Synced` and
+`Healthy`; on any error, missing Application, ambiguity, or uncertain ownership
+it **fails closed** and skips the experiment. Applications are addressed by exact
+name, optionally scoped by `argocd.project`; there is no `appNamespace` key and
+no label-selector discovery. To additionally record chaos actions back to Argo
+CD, activate the best-effort write-back by adding `"argocd"` to the `trackers`
+list (for example, `trackers = ["argocd"]`). The write-back sets a single,
+overwritten annotation recording the most recent termination attempt (written
+before the kill, so it records an attempt rather than a confirmed kill). See the
+[Argo CD plugin documentation](plugins/ArgoCD.md) for full details, including
+authentication/TLS, ApplicationSet annotation preservation, and edge-case
+behavior.

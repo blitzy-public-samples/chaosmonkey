@@ -24,6 +24,7 @@ import (
 	"github.com/Netflix/chaosmonkey/v2/config"
 	"github.com/Netflix/chaosmonkey/v2/config/param"
 	"github.com/Netflix/chaosmonkey/v2/deps"
+	"github.com/Netflix/chaosmonkey/v2/grp"
 	"github.com/Netflix/chaosmonkey/v2/mock"
 )
 
@@ -195,5 +196,124 @@ func TestDoesNotTerminateIfAppIsDisabled(t *testing.T) {
 	ttor := deps.T.(*mock.Terminator)
 	if got, want := ttor.Ncalls, 0; got != want {
 		t.Errorf("Expected terminator to not be called, got ttor.Ncalls=%d", ttor.Ncalls)
+	}
+}
+
+// stubPrecheck is a test-only chaosmonkey.Precheck whose decision is fixed. It
+// records how many times Allow was invoked so the orchestration test can prove
+// the gate is consulted exactly once per termination attempt. (Added for the
+// Argo CD integration per code review M-05.)
+type stubPrecheck struct {
+	allowed bool
+	reason  string
+	target  string
+	err     error
+	calls   int
+}
+
+// Allow satisfies chaosmonkey.Precheck. It returns the fixed target so the
+// orchestration test can prove the gate-resolved target is carried onto the
+// Termination (Argo CD integration, QA findings F3/F4/F5).
+func (p *stubPrecheck) Allow(group grp.InstanceGroup, instance chaosmonkey.Instance) (bool, string, string, error) {
+	p.calls++
+	return p.allowed, p.reason, p.target, p.err
+}
+
+// Compile-time proof the stub satisfies the additive gate contract.
+var _ chaosmonkey.Precheck = (*stubPrecheck)(nil)
+
+// recordingTracker is a test-only chaosmonkey.Tracker that captures the last
+// Termination it received, so a test can prove the gate-resolved target is
+// carried onto Termination.Target and handed to trackers (Argo CD integration,
+// QA findings F3/F4/F5).
+type recordingTracker struct {
+	last  chaosmonkey.Termination
+	calls int
+}
+
+// Track satisfies chaosmonkey.Tracker; it records the termination and succeeds.
+func (t *recordingTracker) Track(trm chaosmonkey.Termination) error {
+	t.calls++
+	t.last = trm
+	return nil
+}
+
+// Compile-time proof the recording tracker satisfies the contract.
+var _ chaosmonkey.Tracker = (*recordingTracker)(nil)
+
+// TestTerminatePrecheckGate is the orchestration proof (code review M-05) that
+// term.doTerminate wires the additive Argo CD pre-flight gate correctly: an
+// allow proceeds to the kill, a deny skips the termination WITHOUT an error, and
+// a gate error fails closed by propagating the error and NOT killing. In every
+// case the gate is consulted exactly once, after the target instance is picked.
+func TestTerminatePrecheckGate(t *testing.T) {
+	cases := []struct {
+		name       string
+		precheck   *stubPrecheck
+		wantErr    bool
+		wantNcalls int
+		wantTarget string
+	}{
+		{"allow proceeds to the kill", &stubPrecheck{allowed: true, target: "argocd-app-x"}, false, 1, "argocd-app-x"},
+		{"deny skips termination without error", &stubPrecheck{allowed: false, reason: "argocd: application not synced"}, false, 0, ""},
+		{"gate error fails closed and propagates", &stubPrecheck{allowed: false, err: errors.New("argocd unreachable")}, true, 0, ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := mockDeps()
+			d.Precheck = tc.precheck
+			// Attach a recording tracker so we can assert the gate-resolved
+			// target is carried onto the Termination and handed to trackers.
+			rec := &recordingTracker{}
+			d.Trackers = []chaosmonkey.Tracker{rec}
+
+			err := Terminate(d, "foo", "prod", "us-east-1", "", "foo-prod")
+			if tc.wantErr && err == nil {
+				t.Fatal("expected Terminate to return an error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("expected Terminate to succeed, got %v", err)
+			}
+
+			ttor := d.T.(*mock.Terminator)
+			if ttor.Ncalls != tc.wantNcalls {
+				t.Errorf("terminator Ncalls = %d, want %d", ttor.Ncalls, tc.wantNcalls)
+			}
+			if tc.precheck.calls != 1 {
+				t.Errorf("precheck consulted %d times, want exactly 1", tc.precheck.calls)
+			}
+
+			// When the gate allowed and the termination proceeded, the
+			// gate-resolved target must have been carried onto Termination.Target
+			// and handed to the tracker (the term.go wiring for F3/F4/F5).
+			if tc.wantNcalls > 0 {
+				if rec.calls != 1 {
+					t.Errorf("tracker consulted %d times, want exactly 1", rec.calls)
+				}
+				if rec.last.Target != tc.wantTarget {
+					t.Errorf("tracker received Termination.Target=%q, want %q", rec.last.Target, tc.wantTarget)
+				}
+			}
+		})
+	}
+}
+
+// TestTerminateNilPrecheckAllowsAll proves a nil Precheck provider is treated as
+// allow-all, so existing behavior is preserved byte-for-byte when the Argo CD
+// feature is unconfigured (code review m-01/M-05). mockDeps leaves Precheck nil.
+func TestTerminateNilPrecheckAllowsAll(t *testing.T) {
+	d := mockDeps()
+	if d.Precheck != nil {
+		t.Fatal("precondition failed: mockDeps should leave Precheck nil")
+	}
+
+	if err := Terminate(d, "foo", "prod", "us-east-1", "", "foo-prod"); err != nil {
+		t.Fatal(err)
+	}
+
+	ttor := d.T.(*mock.Terminator)
+	if got, want := ttor.Ncalls, 1; got != want {
+		t.Errorf("terminator Ncalls = %d, want %d (a nil Precheck must allow-all)", got, want)
 	}
 }

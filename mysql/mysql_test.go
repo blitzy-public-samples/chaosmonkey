@@ -107,7 +107,14 @@ func TestMain(m *testing.M) {
 // startMySQLContainer starts a MySQL docker container
 // Returns the Cmd object associated with the process
 func startMySQLContainer() (*exec.Cmd, error) {
-	cmd := exec.Command("docker", "run", "-e", "MYSQL_ROOT_PASSWORD="+password, fmt.Sprintf("-p3306:%d", port), "mysql:8.0")
+	// The trailing --default-authentication-plugin=mysql_native_password is a
+	// test-only harness fix surfaced by the Argo CD integration final QA
+	// checkpoint: the pinned 2016 go-sql-driver/mysql cannot authenticate
+	// against MySQL 8's default caching_sha2_password plugin, so start mysqld
+	// with the legacy mysql_native_password plugin instead. Because it follows
+	// the image name, the mysql image entrypoint forwards it to mysqld as a
+	// server argument (docker run [OPTIONS] IMAGE [ARG...]).
+	cmd := exec.Command("docker", "run", "-e", "MYSQL_ROOT_PASSWORD="+password, fmt.Sprintf("-p3306:%d", port), "mysql:8.0", "--default-authentication-plugin=mysql_native_password")
 	pipe, err := cmd.StderrPipe()
 	if err != nil {
 		return nil, err
@@ -131,7 +138,14 @@ func startMySQLContainer() (*exec.Cmd, error) {
 		for !strings.Contains(s, readyString) {
 			s, err = reader.ReadString('\n')
 			if err != nil {
-				return nil, err
+				// Pre-existing test-only compile fix (surfaced by the Argo CD
+				// integration final QA checkpoint): this goroutine closure has
+				// no return values, so the original "return nil, err" did not
+				// compile under -tags docker. Log the read error and stop
+				// reading; the parent select below then reaches its 30s timeout
+				// path and reports the failure safely (fail-safe preserved).
+				fmt.Printf("startMySQLContainer: error reading container stderr: %v\n", err)
+				return
 			}
 			fmt.Print(s)
 		}
